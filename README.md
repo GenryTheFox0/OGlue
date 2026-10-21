@@ -11,6 +11,18 @@
 - Первая игра: **Sonic Heroes** — 60 FPS, родной звук, без мигания (пушбуфер, рендер, APU доработаны здесь).
 - В работе: **Shadow the Hedgehog** — уровни, ролики 30 кадров, звук без треска.
 
+## Скриншоты
+
+Родные .exe для Windows, собранные OGlue из игр Xbox:
+
+| Shadow the Hedgehog | |
+|---|---|
+| ![Westopolis](docs/screens/shadow_westopolis.png) | ![Шахта](docs/screens/shadow_shaft.png) |
+
+| Sonic Heroes | | |
+|---|---|---|
+| ![Выбор команды](docs/screens/heroes_team_select.png) | ![Seaside Hill](docs/screens/heroes_seaside_card.png) | ![Геймплей](docs/screens/heroes_seaside_hill.png) |
+
 ## Что OGlue чинит поверх xboxrecomp
 
 - **Звук без треска.** Игры XDK 5849 сотни раз в секунду на миг выключают счётчик звукового чипа

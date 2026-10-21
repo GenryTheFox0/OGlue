@@ -1404,6 +1404,24 @@ void xbox_Nv2aAckBusyBits(void)
     }
 }
 
+/* GENRY 2026-10-21 (Шрам): the flush-kick handshake alone (PFB 0x100410 bit
+ * 16), for the executor to answer in the middle of long work -- D3D's KickOff
+ * spins on it, and while the executor works through a segment the title's
+ * main thread waits (half of a heavy level frame in Shadow the Hedgehog).
+ * EXPERIMENTAL, off: answered during a flip (the vblank wait or the shown
+ * surface's readback) it hangs Shadow after its second frame, so our flip
+ * synchronisation leans on the late answer somewhere. Inside the walk only
+ * with GENRY_ACK_IN_WALK=1 (nv2a_pb_scan.c). */
+void xbox_Nv2aAckFlushKick(void)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
+    if (regs) {
+        volatile uint32_t *r = (volatile uint32_t *)((char *)regs + 0x100410);
+        if (*r & 0x00010000u)
+            *r &= ~0x00010000u;
+    }
+}
+
 /* One word of the NV2A register file (offset from the register base), or NULL
  * before it is mapped. The pushbuffer executor writes what the GPU would when
  * it executes a command: PGRAPH state a title reads back, and DMA_GET. */
@@ -1522,6 +1540,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                          * by PUT to the next kick (nv2a_pb_scan.c); the two-
                          * piece guess below stays as its fallback. */
                         if (last_put && put != last_put && nv2a_pb_follow()) {
+                            extern void nv2a_pb_set_get_reg(volatile uint32_t *);
+                            nv2a_pb_set_get_reg((volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET));
                             uint32_t budget = put > last_put
                                             ? (put - last_put) / 4 + 0x1000u : 0x100000u;
                             followed = nv2a_pb_scan_follow(
@@ -1587,7 +1607,12 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
-                if (s_nv2a_trace) {
+                /* GENRY 2026-10-21 (Шрам): one line per kick only on
+                 * RECOMP_NV2A_TRACE -- RECOMP_PB_EXEC (always on) armed it too,
+                 * a write to the log for every kick, thousands a second. */
+                static int put_log = -1;
+                if (put_log < 0) put_log = getenv("RECOMP_NV2A_TRACE") != NULL;
+                if (s_nv2a_trace && put_log) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "

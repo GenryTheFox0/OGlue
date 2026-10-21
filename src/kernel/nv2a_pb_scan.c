@@ -554,10 +554,35 @@ static int      s_fp_noninc;
 /* Walks from from_va up to put_va. Returns 1 when put_va was reached, 0 when
  * the walk gave up (no JUMP back to put_va within the budget: the title reset
  * the ring some other way) -- the caller then falls back to the old scan. */
+/* GENRY 2026-10-21 (Шрам): DMA GET moves as the walk executes, as on the
+ * hardware, instead of jumping to PUT once the whole kick is done. D3D's
+ * MakeSpace (Shadow the Hedgehog sub_003D4C10 -> 003D4AC0) waits for GET to
+ * free pushbuffer room; with GET held back for the entire segment the title's
+ * main thread sat in that wait for over half of every level frame (40 fps),
+ * the CPU and the executor taking turns instead of overlapping.
+ * GENRY_PB_GET_LIVE=1 turns it on (off by default: one run lost the walk). */
+static volatile uint32_t *s_get_reg;
+static int s_get_live = -1;
+static int s_ack_in_walk;          /* GENRY_ACK_IN_WALK=1 (set below) */
+
+void nv2a_pb_set_get_reg(volatile uint32_t *get)
+{
+    if (s_get_live < 0) {
+        const char *e = getenv("GENRY_PB_GET_LIVE");
+        s_get_live = e && atoi(e) != 0;    /* off unless asked: one run lost the walk */
+    }
+    s_get_reg = s_get_live ? get : NULL;
+    {
+        static int a = -1;
+        if (a < 0) { const char *e = getenv("GENRY_ACK_IN_WALK"); a = e && atoi(e) != 0; }
+        s_ack_in_walk = a;
+    }
+}
+
 int nv2a_pb_scan_follow(uint32_t from_va, uint32_t put_va, uint32_t budget_words)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t va = from_va, words = 0, jumps = 0, unknown = 0;
+    uint32_t va = from_va, words = 0, jumps = 0, unknown = 0, since_get = 0, since_ack = 0;
     int reached = 1;
 
     if (!pb_walk_enabled())
@@ -573,11 +598,35 @@ int nv2a_pb_scan_follow(uint32_t from_va, uint32_t put_va, uint32_t budget_words
     while (va != put_va) {
         uint32_t w;
         if (words >= budget_words) { reached = 0; break; }
+        if (s_ack_in_walk && words - since_ack >= 128u) {
+            since_ack = words;
+            /* GENRY 2026-10-21 (Шрам): the flush-kick handshake (PFB 0x100410)
+             * is answered here too, not only between kicks: D3D's KickOff
+             * spins on it, and a long segment held the title's main thread
+             * for all of it. */
+            extern void xbox_Nv2aAckFlushKick(void);
+            xbox_Nv2aAckFlushKick();
+        }
+        if (s_get_reg && words - since_get >= 512u) {
+            *s_get_reg = va & 0x0FFFFFFFu;     /* everything before va is done */
+            since_get = words;
+        }
         w = *(const uint32_t *)(mem + va);
         va += 4; words++;
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {      /* JUMP */
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
             jumps++;
+            if ((target & 0x0FFFFFFFu) >= 0x04000000u) {
+                /* a jump out of RAM: the walk is reading something that is
+                 * not commands -- stop here rather than fault */
+                static int told;
+                if (told++ < 8)
+                    fprintf(stderr, "[PB] walk lost: word %08X at %08X (from %08X to PUT %08X,"
+                                    " GET last published %08X)\n", w, va - 4, from_va, put_va,
+                            s_get_reg ? *s_get_reg : 0u);
+                reached = 0;
+                break;
+            }
             va = 0x80000000u | (target & 0x0FFFFFFFu);
             continue;
         }

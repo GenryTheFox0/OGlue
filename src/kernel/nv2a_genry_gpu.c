@@ -553,6 +553,11 @@ static void target_readback(GgTarget *t)
     QueryPerformanceCounter(&a);
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)t->staging,
                                      (ID3D11Resource *)t->tex);
+    /* Blocking on purpose: answering the flush-kick handshake while the
+     * flip's surface is read back (or while the flip waits for vblank) hung
+     * Shadow the Hedgehog after its second frame -- something in our flip
+     * synchronisation leans on the late answer (2026-10-21, see
+     * xbox_Nv2aAckFlushKick). */
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)t->staging, 0,
                                        D3D11_MAP_READ, 0, &m)))
         return;
@@ -1505,6 +1510,13 @@ void gg_frame_end(uint32_t present_va)
          * next drawn into, as anything outside the executor may have
          * written it meanwhile. */
         if (ranges_meet(t->va, t->pitch * t->h, present_va, 4)) {
+            /* GENRY_DBG_NO_PRESENT_READBACK=1: measure a frame without the
+             * synchronous read of the shown surface (the window then shows
+             * stale memory) */
+            static int skip_rb = -1;
+            if (skip_rb < 0) skip_rb = getenv("GENRY_DBG_NO_PRESENT_READBACK") != NULL;
+            if (skip_rb)
+                continue;
             if (t->gpu_newer)
                 target_readback(t);
             t->gpu_valid = 0;

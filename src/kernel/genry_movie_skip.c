@@ -65,9 +65,38 @@ static int is_movie_path(const char *p)
     return 0;
 }
 
+/* GENRY_MOVIE_SKIP_EXCLUDE=<name>[,<name>...]: movies the title already lets
+ * the player skip itself (Shadow the Hedgehog's Op.sfd intro), compared by
+ * file name without case. A held for the title's own skip then shows no ring. */
+static int is_excluded(const char *p)
+{
+    const char *list = getenv("GENRY_MOVIE_SKIP_EXCLUDE"), *base = p, *q;
+    size_t bl;
+    if (!list || !*list || !p)
+        return 0;
+    for (q = p; *q; q++)
+        if (*q == '\\' || *q == '/' || *q == ':')
+            base = q + 1;
+    bl = strlen(base);
+    while (*list) {
+        const char *e = strchr(list, ',');
+        size_t n = e ? (size_t)(e - list) : strlen(list), k;
+        if (n == bl) {
+            for (k = 0; k < n && tolower((unsigned char)list[k]) == tolower((unsigned char)base[k]); k++)
+                ;
+            if (k == n)
+                return 1;
+        }
+        if (!e)
+            break;
+        list = e + 1;
+    }
+    return 0;
+}
+
 void genry_movie_opened(uint32_t token, const char *guest_path)
 {
-    if (!skip_on() || !token || !is_movie_path(guest_path))
+    if (!skip_on() || !token || !is_movie_path(guest_path) || is_excluded(guest_path))
         return;
     s_skip = 0;
     s_hold_ms = 0;
@@ -180,15 +209,11 @@ void genry_movie_overlay(uint32_t *argb, uint32_t w, uint32_t h)
         prog = 1.0f;
         flash = 1.0f - since / 900.0f;
         alpha = since < 450u ? 1.0f : 1.0f - (since - 450u) / 450.0f;
-    } else if (s_hold_ms && playing(now)) {
+    } else if (s_hold_ms && playing(now) && now - s_hold_ms >= 200u) {
+        /* only once A is clearly held: a tap the title uses itself shows
+         * nothing */
         prog = clampf((float)(now - s_hold_ms) / (float)hold_len(), 0.0f, 1.0f);
-        alpha = clampf(0.35f + prog * 3.0f, 0.0f, 1.0f);
-    } else if (playing(now) && now - s_opened_ms < 3500u) {
-        /* a hint while the movie starts: the button, dim, no ring */
-        uint64_t since = now - s_opened_ms;
-        prog = 0.0f;
-        alpha = since < 500u ? since / 500.0f * 0.55f
-              : since > 2800u ? (3500u - since) / 700.0f * 0.55f : 0.55f;
+        alpha = clampf((float)(now - s_hold_ms - 200u) / 150.0f, 0.0f, 1.0f);
     } else {
         return;
     }

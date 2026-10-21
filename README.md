@@ -47,6 +47,9 @@
 
 Автор: GenryTheFox · Telegram в профиле.
 
+📖 **[Вики](https://github.com/GenryTheFox0/OGlue/wiki)** — какие костыли оригинала убраны, амбиции проекта,
+путь к полному DirectX 11, сборка игры, переключатели.
+
 ---
 
 Ниже — исходный README xboxrecomp.

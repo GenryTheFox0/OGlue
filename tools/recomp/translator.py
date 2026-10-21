@@ -2922,6 +2922,19 @@ class FunctionTranslator:
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
 
+        # Every flag variable a statement reads is declared. The scans above
+        # decide by mnemonic, and lahf (reads CF) and fcmovcc (reads _flags)
+        # were in neither list: Sonic Heroes' seeded gaps hold data that decodes
+        # to both, and the build stopped on an undeclared identifier.
+        import re as _re
+        _body = "\n".join(lines)
+        _open = next((k for k, l in enumerate(lines) if l == "{"), None)
+        if _open is not None:
+            for _var in ("_cf", "_flags"):
+                if (_re.search(r"\b%s\b" % _var, _body)
+                        and not _re.search(r"\bint %s\b" % _var, _body)):
+                    lines.insert(_open + 1, f"    int {_var} = 0; /* read by a statement the scans missed */")
+
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)
         import re

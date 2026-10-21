@@ -55,6 +55,14 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                            v * MCPX_HW_NOTIFIER_COUNT + notifier);
     notify_offset += 15;
 
+    {
+        static int tr = -1;
+        if (tr < 0) tr = getenv("GENRY_FE_TRACE") != NULL;
+        if (tr)
+            fprintf(stderr, "[NOTIFY] v=%04X n=%d st=%02X at %08X t=%llu\n",
+                    (unsigned)v, notifier, (unsigned)status,
+                    (unsigned)notify_offset, (unsigned long long)GetTickCount64());
+    }
     stb_phys(address_space_memory, notify_offset, (uint8_t)status);
     stb_phys(address_space_memory, notify_offset - 1, 1);
 
@@ -127,8 +135,20 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
-static void voice_off(MCPXAPUState *d, uint16_t v)
+#define voice_off(d, v) voice_off_at((d), (v), __LINE__)
+static void voice_off_at(MCPXAPUState *d, uint16_t v, int line)
 {
+    {
+        static int tr = -1;
+        if (tr < 0) tr = getenv("GENRY_FE_TRACE") != NULL;
+        if (tr)
+            fprintf(stderr, "[VOFF] v=%04X line=%d fmt=%08X cbo=%u ebo=%u t=%llu\n",
+                    (unsigned)v, line,
+                    voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu),
+                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                    voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                    (unsigned long long)GetTickCount64());
+    }
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -188,6 +208,46 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     d->regs[NV_PAPU_FEDECMETH] = method;
     d->regs[NV_PAPU_FEDECPARAM] = argument;
     unsigned int selected_handle, list;
+
+    /* GENRY_FE_TRACE: the voice start/stop commands the title sends, to see
+     * which voice a stream asks for and whether it ever asks. */
+    {
+        static int fe_tr = -1;
+        if (fe_tr < 0) fe_tr = getenv("GENRY_FE_TRACE") != NULL;
+        if (fe_tr && (method == NV1BA0_PIO_VOICE_ON || method == NV1BA0_PIO_VOICE_OFF ||
+                      method == NV1BA0_PIO_VOICE_RELEASE || method == NV1BA0_PIO_VOICE_PAUSE ||
+                      method == NV1BA0_PIO_SET_VOICE_CFG_FMT))
+        {
+            uint32_t hv = (method == NV1BA0_PIO_SET_VOICE_CFG_FMT)
+                        ? (d->regs[NV_PAPU_FECV] & 0xFFFF) : (argument & 0xFFFF);
+            hwaddr na = d->regs[NV_PAPU_FENADDR] +
+                        16 * (MCPX_HW_NOTIFIER_BASE_OFFSET +
+                              hv * MCPX_HW_NOTIFIER_COUNT + MCPX_HW_NOTIFIER_SSLA_DONE);
+            fprintf(stderr, "[FE] %s arg=%08X cur=%04X t=%llu notif=%02X/%02X\n",
+                    method == NV1BA0_PIO_VOICE_ON ? "ON" :
+                    method == NV1BA0_PIO_VOICE_OFF ? "OFF" :
+                    method == NV1BA0_PIO_VOICE_RELEASE ? "REL" :
+                    method == NV1BA0_PIO_VOICE_PAUSE ? "PAUSE" : "FMT",
+                    argument, (unsigned)(d->regs[NV_PAPU_FECV] & 0xFFFF),
+                    (unsigned long long)(GetTickCount64()),
+                    hv < MCPX_HW_MAX_VOICES ? ldub_phys(address_space_memory, na + 14) : 0xEEu,
+                    hv < MCPX_HW_MAX_VOICES ? ldub_phys(address_space_memory, na + 15) : 0xEEu);
+            if (getenv("GENRY_FE_STACK") &&
+                (method == NV1BA0_PIO_VOICE_ON || method == NV1BA0_PIO_VOICE_OFF)) {
+                extern void genry_print_stack(const char *tag);
+                extern __declspec(thread) uint32_t g_esi, g_ecx;
+                char tag[160];
+                uint32_t esi = g_esi, apu = esi ? ldl_le_phys(address_space_memory, esi + 8) : 0;
+                uint32_t own_va = apu ? apu + 0x88 + 4 * hv : 0;
+                snprintf(tag, sizeof tag, "%s %04X tid %lu esi=%08X ecx=%08X apu=%08X own@%08X=%08X",
+                         method == NV1BA0_PIO_VOICE_ON ? "ON" : "OFF", (unsigned)hv,
+                         (unsigned long)GetCurrentThreadId(), esi, g_ecx, apu, own_va,
+                         (apu > 0x10000 && apu < 0x08000000)
+                             ? ldl_le_phys(address_space_memory, own_va) : 0xEEEEEEEEu);
+                genry_print_stack(tag);
+            }
+        }
+    }
 
     switch (method) {
     case NV1BA0_PIO_VOICE_LOCK:
@@ -490,6 +550,14 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case SE2FE_IDLE_VOICE:
+        {
+            static int tr = -1;
+            if (tr < 0) tr = getenv("GENRY_FE_TRACE") != NULL;
+            if (tr)
+                fprintf(stderr, "[IDLE] v=%04X trap=%d t=%llu\n", (unsigned)argument,
+                        (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) != 0,
+                        (unsigned long long)GetTickCount64());
+        }
         if (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) {
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FEMETHMODE;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;

@@ -219,6 +219,8 @@ extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
+extern int xbox_DispatchLockEnter(int timeout_ms);
+extern void xbox_DispatchLockLeave(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 #if defined(_MSC_VER)
@@ -235,6 +237,50 @@ extern APU_TLS uint32_t g_fs_base;
  * while a guest thread sits at raised IRQL, which is when the single-CPU
  * console could not have taken the interrupt. The routine acknowledges by
  * writing ISTS, which drops the line through update_irq. */
+/* One service routine call at a time: the frame thread and a title thread
+ * lowering IRQL (apu_irql_lower_hook) can both find the line up. */
+static volatile LONG s_isr_busy;
+
+/* Called by the kernel on a title thread whose IRQL has just dropped below
+ * DISPATCH_LEVEL: the interrupt a voice command raised is taken there and
+ * then, on that thread's stack, as the processor would have taken it, and
+ * the DPC it queues runs right after (kernel_hal.c, irql_lowered_service). */
+static void apu_irql_lower_hook(void)
+{
+    MCPXAPUState *d = g_state;
+    uint32_t kint, routine, context;
+    apu_guest_fn fn;
+
+    if (!d || !g_apu_ram_ptr)
+        return;
+    /* The frame thread may be in the routine right now: the DPC it queues
+     * has to be in the queue before this thread drains it and goes on. */
+    {
+        ULONGLONG until = GetTickCount64() + 5;
+        while (InterlockedCompareExchange(&s_isr_busy, 0, 0) && GetTickCount64() < until)
+            Sleep(0);
+    }
+    if (d->set_irq)
+        update_irq(d);
+    if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
+        return;
+    kint = xbox_GetConnectedInterrupt(APU_VECTOR);
+    if (!kint)
+        return;
+    routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
+    context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
+    fn = routine ? recomp_lookup(routine) : NULL;
+    if (!fn)
+        return;
+    if (InterlockedExchange(&s_isr_busy, 1))
+        return;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    InterlockedExchange(&s_isr_busy, 0);
+}
+
 static void apu_deliver_irq(MCPXAPUState *d)
 {
     /* Per thread, like the g_fs_base it guards: a new instance's frame
@@ -248,9 +294,6 @@ static void apu_deliver_irq(MCPXAPUState *d)
 
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
         return;
-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
-        return;
-    held_off = 0;
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
         return;
@@ -266,18 +309,52 @@ static void apu_deliver_irq(MCPXAPUState *d)
         g_fs_base = tib;
         tib_ready = 1;
     }
-    slot = xbox_worker_stack_alloc();
-    if (slot < 0)
-        return;
 
+    /* Take the processor first. This used to wait for a moment when no title
+     * thread at all was at DISPATCH_LEVEL -- which is not what masks an
+     * interrupt on hardware, and with the game and CRI's music thread both
+     * raising all the time it could take 50 frames. DirectSound's idle-voice
+     * trap then reached its routine after the voice had been released and
+     * handed to the next song, and the routine's "voice done" stopped that
+     * song. The dispatch lock is held only for one DISPATCH_LEVEL stretch at a
+     * time, so the routine gets in as soon as the current one ends -- and runs
+     * alone with DirectSound, as on the one CPU. */
     qemu_mutex_unlock(&d->lock);
+    if (!xbox_DispatchLockEnter(2) && ++held_off <= 50) {
+        xbox_DispatchLockLeave();
+        qemu_mutex_lock(&d->lock);
+        return;                 /* next frame */
+    }
+    held_off = 0;
+    if (!InterlockedCompareExchange(&s_irq_line, 0, 0) ||   /* taken meanwhile */
+            InterlockedExchange(&s_isr_busy, 1)) {
+        xbox_DispatchLockLeave();
+        qemu_mutex_lock(&d->lock);
+        return;
+    }
+    slot = xbox_worker_stack_alloc();
+    if (slot < 0) {
+        InterlockedExchange(&s_isr_busy, 0);
+        xbox_DispatchLockLeave();
+        qemu_mutex_lock(&d->lock);
+        return;
+    }
+
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    InterlockedExchange(&s_isr_busy, 0);
+    /* And the DPC it queued, before the processor is let go: what the
+     * interrupted code would have found done when it ran again. */
+    {
+        extern void xbox_DrainDpcsInline(void);
+        xbox_DrainDpcsInline();
+    }
     xbox_worker_stack_free(slot);
+    xbox_DispatchLockLeave();
     qemu_mutex_lock(&d->lock);
 
     {
@@ -1246,6 +1323,10 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
     d->ram_ptr = ram_ptr;
+    {
+        extern void xbox_SetApuIrqlLowerHook(void (*fn)(void));
+        xbox_SetApuIrqlLowerHook(apu_irql_lower_hook);
+    }
     /* A line left up by a previous instance would call the guest ISR
      * against this one's empty ISTS. */
     InterlockedExchange(&s_irq_line, 0);

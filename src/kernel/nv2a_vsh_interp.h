@@ -49,6 +49,11 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * FINAL flag within program memory), which the caller treats as "cannot
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+/* Decode the current program now, on one thread, so that nv2a_vsh_run may
+ * then be called from several at once -- unless the program writes the
+ * constant file (nv2a_vsh_writes_constants), which keeps runs ordered. */
+void nv2a_vsh_prepare(void);
+int  nv2a_vsh_writes_constants(void);
 
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);

@@ -1,3 +1,24 @@
+# OGlue
+
+**OGlue** — статический рекомпилятор игр оригинального Xbox (2001) в родные программы для ПК.
+Без эмуляции: код x86 игры переводится в C и собирается как обычная программа, видеочип NV2A
+рисуется через свой рендер, звук и ядро системы — свои.
+
+Брат ReXGlue (Xbox 360) — только для первого Xbox.
+
+- Первая игра: **Sonic Heroes** — 60 FPS, родной звук, без мигания (пушбуфер, рендер, APU доработаны здесь).
+- В работе: **Shadow the Hedgehog**.
+
+Основан на [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) (MIT, © 2026 sp00nz) — переводчик x86
+оттуда, рантайм и фиксы — OGlue. Части звука и регистров NV2A — из [xemu](https://github.com/xemu-project/xemu)
+под LGPL-2.1 (см. NOTICE и LICENSES/).
+
+Автор: GenryTheFox · Telegram в профиле.
+
+---
+
+Ниже — исходный README xboxrecomp.
+
 # xboxrecomp
 
 ```

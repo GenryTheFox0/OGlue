@@ -532,6 +532,24 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     }
 }
 
+/* Who holds the guest lock at <guest_va>, for a hang report. */
+void xbox_cs_report(uint32_t guest_va)
+{
+    PRTL_CRITICAL_SECTION g =
+        (PRTL_CRITICAL_SECTION)((uintptr_t)g_xbox_mem_offset + guest_va);
+    CRITICAL_SECTION* cs = xbox_cs_shadow(g);
+    XBOX_CS_SLOT* slot = cs ? xbox_cs_slot_of(cs) : NULL;
+    if (!cs) {
+        fprintf(stderr, "[CSREPORT] 0x%08X: no shadow\n", guest_va);
+        return;
+    }
+    fprintf(stderr, "[CSREPORT] 0x%08X: host owner %lu recursion %ld lock %ld;"
+            " taken by tid %lu at guest 0x%08X depth %ld\n", guest_va,
+            (unsigned long)(uintptr_t)cs->OwningThread, (long)cs->RecursionCount,
+            (long)cs->LockCount, slot ? slot->owner_tid : 0ul,
+            slot ? slot->owner_site : 0u, slot ? slot->depth : 0l);
+}
+
 VOID __stdcall xbox_RtlInitializeCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     /* Creating the shadow here is not required -- Enter does it -- but doing

@@ -101,6 +101,10 @@ int xa2_init(void)
         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
         goto fail;
     }
+    /* GENRY_MUTE: everything runs and is paced as usual, nothing is heard --
+     * for test runs next to someone playing. */
+    if (getenv("GENRY_MUTE"))
+        IXAudio2MasteringVoice_SetVolume(g_xa2_master, 0.0f, XAUDIO2_COMMIT_NOW);
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
     wfx.nChannels       = XA2_CHANNELS;

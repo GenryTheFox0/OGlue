@@ -147,8 +147,28 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     case XC_VIDEO:
         /* NTSC with widescreen and HDTV support enabled */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV_480p | XC_VIDEO_FLAGS_PAL_60Hz;
             if (Type) *Type = 4; /* REG_DWORD */
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_FACTORY_GAME_REGION:
+        /* Every region. XAPI starts a title only if the console's region
+         * shares a bit with the certificate's (Sonic Heroes, PAL: 4); with no
+         * case here it read 0. */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = 0x00000007;
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        break;
+
+    case XC_FACTORY_AV_REGION:
+        /* NTSC-M at 60 Hz, so PAL titles run at 60 too. */
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = XC_AV_STANDARD_NTSC_M | XC_AV_FLAGS_60Hz;
+            if (Type) *Type = 4;
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
         break;

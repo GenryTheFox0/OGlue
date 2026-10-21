@@ -751,12 +751,18 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     s->obj_va = obj_va;
     s->tls_size = tls_size;
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+    th = CreateThread(NULL, 0, bridge_thread_main, s, CREATE_SUSPENDED, NULL);
     if (!th) free(s);
-    /* Record the game thread so a host-tick-driven title's watchdog can sample
-     * it via xbox_thread_debug_handle. Harmless for default-model titles: they
-     * spawn workers too, but never read it back. See kernel_thread.c. */
-    else xbox_set_game_thread(th);
+    else {
+        extern void xbox_pin_guest_thread(HANDLE h);
+        xbox_pin_guest_thread(th);       /* GENRY_GUEST_CORE: one CPU, as on the Xbox */
+        ResumeThread(th);
+        /* Record the game thread so a host-tick-driven title's watchdog can
+         * sample it via xbox_thread_debug_handle. Harmless for default-model
+         * titles: they spawn workers too, but never read it back. See
+         * kernel_thread.c. */
+        xbox_set_game_thread(th);
+    }
     return th;
 }
 
@@ -2518,7 +2524,18 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    /* Out of the ISR's way and it out of ours: the APU's service routine is
+     * delivered under the same dispatch lock (apu_deliver_irq), and
+     * DirectSound's DPC reads and clears what that routine collected through
+     * here. Without it the two ran at once and a voice's status bits went
+     * missing between them. */
+    {
+        extern int xbox_DispatchLockEnter(int timeout_ms);
+        extern void xbox_DispatchLockLeave(void);
+        xbox_DispatchLockEnter(50);
+        fn();
+        xbox_DispatchLockLeave();
+    }
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2758,6 +2775,15 @@ static void kernel_drain_dpcs(void)
         if (d.dpc)
             kernel_run_dpc(d.dpc, d.arg1, d.arg2);
     }
+}
+
+/* The same, on a title thread that has just lowered IRQL below
+ * DISPATCH_LEVEL (kernel_hal.c, irql_lowered_service). */
+void xbox_DrainDpcsInline(void)
+{
+    if (g_dpc_head == g_dpc_tail)
+        return;
+    kernel_drain_dpcs();
 }
 
 /* ── KeInitializeDpc (ordinal 107) ────────────────────────
@@ -3025,7 +3051,15 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
         Sleep(10);
         kernel_vblank_tick();  /* the GPU's frame clock */
-        kernel_drain_dpcs();   /* deferred work, before due timers */
+        /* Deferred work, before due timers. At DISPATCH_LEVEL for the whole
+         * drain, so the dispatch lock is held before a DPC leaves the queue:
+         * one taken out and then left waiting for a title thread to lower
+         * IRQL would run after that thread's next call, not before it. */
+        if (g_dpc_head != g_dpc_tail) {
+            int _irql = xbox_IrqlEnterInterrupt(2);
+            kernel_drain_dpcs();
+            xbox_IrqlLeaveInterrupt(_irql);
+        }
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -3072,7 +3106,21 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     if (!g_timer_started) {
         InitializeCriticalSection(&g_timer_lock);
         g_timer_started = 1;
-        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+        {
+            /* It runs the title's DPCs and interrupt handlers: on the
+             * title's core when GENRY_GUEST_CORE is set, above its threads
+             * the way an interrupt is. */
+            extern void xbox_pin_guest_thread(HANDLE h);
+            extern DWORD_PTR xbox_guest_affinity(void);
+            HANDLE tt = CreateThread(NULL, 0, kernel_timer_thread, NULL, CREATE_SUSPENDED, NULL);
+            if (tt) {
+                xbox_pin_guest_thread(tt);
+                if (xbox_guest_affinity())
+                    SetThreadPriority(tt, THREAD_PRIORITY_TIME_CRITICAL);
+                ResumeThread(tt);
+                CloseHandle(tt);
+            }
+        }
     }
 
     EnterCriticalSection(&g_timer_lock);
@@ -3515,9 +3563,10 @@ static NTSTATUS bridge_create_file_impl(
                 xbox_missing_note(gpath, status, (uint32_t)access,
                                   (uint32_t)disposition, (uint32_t)options, 0);
         } else if (ntcreate || xbox_missing_verbose())
-            fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X\n",
+            fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X h=%08X\n",
                     gpath, (unsigned)disposition, (unsigned)options,
-                    g_xbox_kernel_caller, status);
+                    g_xbox_kernel_caller, status,
+                    handle_va ? BRIDGE_MEM32(handle_va) : 0u);
     }
     fflush(stderr);
     return st;
@@ -3971,8 +4020,8 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
-                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
+            fprintf(stderr, "  [READ] h=%08X from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    STACK_ARG(0), g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
@@ -6721,6 +6770,72 @@ static KE_SHADOW_SLOT g_ke_shadow[KE_SHADOW_SIZE];
 static CRITICAL_SECTION g_ke_shadow_cs;
 static int g_ke_shadow_init;
 
+/* An index over g_ke_shadow by guest VA. Every KeSetEvent and wait looked its
+ * object up by scanning all 4096 slots under the lock -- and a miss scanned
+ * every one: a quarter of Sonic Heroes' main thread, sampled. Open addressing,
+ * slot + 1 per entry, 0 empty, -1 deleted; always under g_ke_shadow_cs. */
+#define KE_HASH_SIZE 16384u
+static int32_t g_ke_hash[KE_HASH_SIZE];
+static uint32_t g_ke_free_hint;
+
+static uint32_t ke_hash_of(uint32_t va)
+{
+    return ((va >> 2) * 2654435761u) >> 18;        /* 14 bits */
+}
+
+static int ke_idx_find(uint32_t va)
+{
+    uint32_t h = ke_hash_of(va), k;
+    for (k = 0; k < KE_HASH_SIZE; k++) {
+        int32_t e = g_ke_hash[(h + k) & (KE_HASH_SIZE - 1)];
+        if (e == 0)
+            return -1;
+        if (e > 0 && g_ke_shadow[e - 1].in_use && g_ke_shadow[e - 1].guest_va == va)
+            return e - 1;
+    }
+    return -1;
+}
+
+static void ke_idx_add(uint32_t va, int slot)
+{
+    uint32_t h = ke_hash_of(va), k;
+    for (k = 0; k < KE_HASH_SIZE; k++) {
+        int32_t *e = &g_ke_hash[(h + k) & (KE_HASH_SIZE - 1)];
+        if (*e <= 0) {
+            *e = slot + 1;
+            return;
+        }
+    }
+}
+
+static void ke_idx_del(int slot)
+{
+    uint32_t h = ke_hash_of(g_ke_shadow[slot].guest_va), k;
+    for (k = 0; k < KE_HASH_SIZE; k++) {
+        int32_t *e = &g_ke_hash[(h + k) & (KE_HASH_SIZE - 1)];
+        if (*e == 0)
+            return;
+        if (*e == slot + 1) {
+            *e = -1;
+            return;
+        }
+    }
+}
+
+/* A free slot, searched from where the last one was found. */
+static int ke_free_slot(void)
+{
+    uint32_t k;
+    for (k = 0; k < KE_SHADOW_SIZE; k++) {
+        uint32_t i = (g_ke_free_hint + k) % KE_SHADOW_SIZE;
+        if (!g_ke_shadow[i].in_use) {
+            g_ke_free_hint = i + 1;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 static void ke_shadow_init(void)
 {
     if (g_ke_shadow_init)
@@ -6728,6 +6843,7 @@ static void ke_shadow_init(void)
     InitializeCriticalSection(&g_ke_shadow_cs);
     /* Wipe any stale pointers from a prior lifecycle (defensive). */
     memset(g_ke_shadow, 0, sizeof(g_ke_shadow));
+    memset(g_ke_hash, 0, sizeof(g_ke_hash));
     g_ke_shadow_init = 1;
 }
 
@@ -6745,8 +6861,10 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
     EnterCriticalSection(&g_ke_shadow_cs);
 
     /* Reuse an existing slot for this VA, if present. */
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
+    {
+        int f = ke_idx_find(guest_va);
+        if (f >= 0) {
+            i = (uint32_t)f;
             if (g_ke_shadow[i].host_handle && g_ke_shadow[i].host_handle != host)
                 CloseHandle(g_ke_shadow[i].host_handle);
             g_ke_shadow[i].host_handle = host;
@@ -6756,11 +6874,14 @@ static void ke_shadow_insert(uint32_t guest_va, HANDLE host)
     }
 
     /* Otherwise find a free slot. */
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (!g_ke_shadow[i].in_use) {
+    {
+        int f = ke_free_slot();
+        if (f >= 0) {
+            i = (uint32_t)f;
             g_ke_shadow[i].in_use      = 1;
             g_ke_shadow[i].guest_va    = guest_va;
             g_ke_shadow[i].host_handle = host;
+            ke_idx_add(guest_va, f);
             LeaveCriticalSection(&g_ke_shadow_cs);
             return;
         }
@@ -6786,12 +6907,12 @@ static HANDLE ke_shadow_lookup(uint32_t guest_va)
     ke_shadow_init();
 
     EnterCriticalSection(&g_ke_shadow_cs);
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
-            h = g_ke_shadow[i].host_handle;
-            break;
-        }
+    {
+        int f = ke_idx_find(guest_va);
+        if (f >= 0)
+            h = g_ke_shadow[f].host_handle;
     }
+    (void)i;
     LeaveCriticalSection(&g_ke_shadow_cs);
     return h;
 }
@@ -6807,14 +6928,16 @@ static void ke_shadow_remove(uint32_t guest_va)
     ke_shadow_init();
 
     EnterCriticalSection(&g_ke_shadow_cs);
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
+    {
+        int f = ke_idx_find(guest_va);
+        if (f >= 0) {
+            i = (uint32_t)f;
             if (g_ke_shadow[i].host_handle)
                 CloseHandle(g_ke_shadow[i].host_handle);
+            ke_idx_del(f);
             g_ke_shadow[i].in_use      = 0;
             g_ke_shadow[i].guest_va    = 0;
             g_ke_shadow[i].host_handle = NULL;
-            break;
         }
     }
     LeaveCriticalSection(&g_ke_shadow_cs);
@@ -6863,22 +6986,23 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
 
     ke_shadow_init();
     EnterCriticalSection(&g_ke_shadow_cs);
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (g_ke_shadow[i].in_use && g_ke_shadow[i].guest_va == guest_va) {
-            h = g_ke_shadow[i].in_use == 2 ? g_ke_shadow[i].host_handle : NULL;
+    {
+        int f = ke_idx_find(guest_va);
+        if (f >= 0) {
+            h = g_ke_shadow[f].in_use == 2 ? g_ke_shadow[f].host_handle : NULL;
             LeaveCriticalSection(&g_ke_shadow_cs);
             return h;                              /* a KeInitializeEvent shadow: old path */
         }
-    }
-    for (i = 0; i < KE_SHADOW_SIZE; i++) {
-        if (!g_ke_shadow[i].in_use) {
+        f = ke_free_slot();
+        if (f >= 0) {
+            i = (uint32_t)f;
             h = CreateEventA(NULL, *type == 0, BRIDGE_MEM32(guest_va + 4) != 0, NULL);
             if (h) {
                 g_ke_shadow[i].in_use      = 2;
                 g_ke_shadow[i].guest_va    = guest_va;
                 g_ke_shadow[i].host_handle = h;
+                ke_idx_add(guest_va, f);
             }
-            break;
         }
     }
     LeaveCriticalSection(&g_ke_shadow_cs);
@@ -10060,6 +10184,58 @@ static void kernel_thunk_dispatch_body(void)
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+
+    /* GENRY_KTRACE_AT=<s>: a flight recorder -- the last 16 kernel calls of
+     * every thread (ordinal, guest return address, first three arguments),
+     * printed once, <s> seconds after the first call. Which call a stalled
+     * thread is sitting in, without tracing everything that led there. */
+    {
+        #define KT_THREADS 48
+        #define KT_DEPTH   16
+        static int kt_on = -1;
+        static ULONGLONG kt_t0, kt_at;
+        static volatile LONG kt_n, kt_dumped;
+        static struct { DWORD tid; uint32_t pos; uint32_t r[KT_DEPTH][5]; } kt[KT_THREADS];
+        static __declspec(thread) int kt_me = -1;
+        if (kt_on < 0) {
+            const char *e = getenv("GENRY_KTRACE_AT");
+            kt_on = e != NULL;
+            kt_at = e ? (ULONGLONG)(atof(e) * 1000.0) : 0;
+            kt_t0 = GetTickCount64();
+        }
+        if (kt_on) {
+            if (kt_me < 0) {
+                LONG k = InterlockedIncrement(&kt_n) - 1;
+                kt_me = k < KT_THREADS ? (int)k : -2;
+                if (kt_me >= 0)
+                    kt[kt_me].tid = GetCurrentThreadId();
+            }
+            if (kt_me >= 0) {
+                uint32_t *r = kt[kt_me].r[kt[kt_me].pos++ % KT_DEPTH];
+                r[0] = ordinal;
+                r[1] = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+                r[2] = g_esp ? BRIDGE_MEM32(g_esp + 4) : 0;
+                r[3] = g_esp ? BRIDGE_MEM32(g_esp + 8) : 0;
+                r[4] = g_esp ? BRIDGE_MEM32(g_esp + 12) : 0;
+            }
+            if (GetTickCount64() - kt_t0 >= kt_at
+                && InterlockedCompareExchange(&kt_dumped, 1, 0) == 0) {
+                int t, j;
+                fprintf(stderr, "[KTRACE] last kernel calls per thread:\n");
+                for (t = 0; t < KT_THREADS && t < kt_n; t++) {
+                    uint32_t p = kt[t].pos;
+                    fprintf(stderr, "[KTRACE] thread %lu (%u calls)\n",
+                            (unsigned long)kt[t].tid, p);
+                    for (j = 0; j < KT_DEPTH && j < (int)p; j++) {
+                        uint32_t *r = kt[t].r[(p - 1 - j) % KT_DEPTH];
+                        fprintf(stderr, "[KTRACE]   ord %3u ret %08X args %08X %08X %08X\n",
+                                r[0], r[1], r[2], r[3], r[4]);
+                    }
+                }
+                fflush(stderr);
+            }
+        }
+    }
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the

@@ -1078,11 +1078,22 @@ NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, P
 #define XC_PARENTAL_CONTROL       XC_P_CONTROL_GAMES
 #define XC_PARENTAL_PASSWORD      XC_P_CONTROL_PASSWORD
 
-/* Video standard flags in XC_VIDEO */
-#define XC_VIDEO_FLAGS_WIDESCREEN   0x01
-#define XC_VIDEO_FLAGS_HDTV         0x02
-#define XC_VIDEO_FLAGS_PAL_I        0x04
-#define XC_VIDEO_FLAGS_LETTERBOX    0x10
+/* Video flags in XC_VIDEO: the console's AV_FLAGS_* (as Cxbx-Reloaded's
+ * kernel/common/xbox.h has them). They were small made-up numbers
+ * (widescreen 0x01 ...) that no title reads as meant. */
+#define XC_VIDEO_FLAGS_WIDESCREEN   0x00010000
+#define XC_VIDEO_FLAGS_HDTV_720p    0x00020000
+#define XC_VIDEO_FLAGS_HDTV_1080i   0x00040000
+#define XC_VIDEO_FLAGS_HDTV_480p    0x00080000
+#define XC_VIDEO_FLAGS_HDTV         XC_VIDEO_FLAGS_HDTV_480p
+#define XC_VIDEO_FLAGS_LETTERBOX    0x00100000
+#define XC_VIDEO_FLAGS_PAL_60Hz     0x00400000
+
+/* Factory settings (EEPROM) */
+#define XC_FACTORY_AV_REGION        0x103
+#define XC_FACTORY_GAME_REGION      0x104
+#define XC_AV_STANDARD_NTSC_M       0x00000100
+#define XC_AV_FLAGS_60Hz            0x00400000
 
 /* Unknown ordinals - stub */
 VOID    __stdcall xbox_Unknown_8(void);

@@ -12,6 +12,8 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
 
 /* ============================================================================
@@ -344,11 +346,123 @@ NTSTATUS __stdcall xbox_NtDuplicateObject(
     return STATUS_SUCCESS;
 }
 
+/* GENRY_GUEST_CORE=<n>: every thread that runs title code on host core n.
+ *
+ * The Xbox has one CPU. A title's threads never run at the same instant, and
+ * code written for it leans on that without saying so: Sonic Heroes animates
+ * its models on one thread while another submits them, and on a PC both run
+ * at once -- a vertex half-written in a frame stretches a triangle across the
+ * screen for a frame, over and over. Pinning the title's threads (and the
+ * one that runs its DPCs and interrupt handlers) to one core gives back the
+ * console's interleaving; the GPU executor, the APU and the window stay on
+ * the other cores. Returns the mask, 0 when off. */
+DWORD_PTR xbox_guest_affinity(void)
+{
+    static DWORD_PTR mask = (DWORD_PTR)-1;
+    if (mask == (DWORD_PTR)-1) {
+        const char *e = getenv("GENRY_GUEST_CORE");
+        SYSTEM_INFO si;
+        int core = (e && *e) ? atoi(e) : -1;
+        GetSystemInfo(&si);
+        mask = (core >= 0 && (DWORD)core < si.dwNumberOfProcessors && core < 64)
+             ? ((DWORD_PTR)1 << core) : 0;
+        if (mask)
+            fprintf(stderr, "[KERNEL] title threads on host core %d\n", core);
+    }
+    return mask;
+}
+
+void xbox_pin_guest_thread(HANDLE h)
+{
+    DWORD_PTR m = xbox_guest_affinity();
+    if (m && h)
+        SetThreadAffinityMask(h, m);
+}
+
+/* Lost wake-ups between a thread that parks itself and the one that wakes it.
+ *
+ * Sonic Heroes' sound thread does its work, then NtSuspendThread(itself); the
+ * main thread hands it more with NtResumeThread, thousands of times a second.
+ * On the console that cannot race: one CPU, and the sound thread outranks the
+ * main one, so by the time the main thread can resume it, it has parked. Here
+ * the resume can land first -- on a thread that is still running, where Win32
+ * does nothing -- and the park that follows is never undone: the sound thread
+ * sleeps for good and the music stops a minute in.
+ *
+ * So a resume that finds its thread running is remembered (one, not a count)
+ * and that thread's next park on itself returns at once, as if resumed the
+ * moment it parked. A thread resumed while running and never parking again
+ * just keeps the token; one that does park takes one extra turn of its loop. */
+#define WAKE_SLOTS 64
+/* One slot per thread that parks itself. Under s_wake_lock: `parked` while it
+ * sleeps on `ev`, `token` for a resume that came while it was running. The
+ * check and the sleep used to be two steps -- read the token, then
+ * SuspendThread(self) -- and a resume landing between them set a token that
+ * nobody read again: the thread slept with a wake owed to it. CRI's idle
+ * thread, which does the file reads for every stream, did that and every
+ * song and voice line stopped together. Now a park and a resume see each
+ * other under one lock, and the park is a wait on the thread's own event. */
+static struct {
+    DWORD tid;
+    LONG token;
+    LONG parked;
+    HANDLE ev;
+} s_wake[WAKE_SLOTS];
+static SRWLOCK s_wake_lock = SRWLOCK_INIT;
+
+/* Called with s_wake_lock held. */
+static int wake_slot_locked(DWORD tid, int create)
+{
+    int i, free_i = -1;
+    for (i = 0; i < WAKE_SLOTS; i++) {
+        if (s_wake[i].tid == tid) return i;
+        if (!s_wake[i].tid && free_i < 0) free_i = i;
+    }
+    if (!create || free_i < 0)
+        return -1;
+    if (!s_wake[free_i].ev)
+        s_wake[free_i].ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!s_wake[free_i].ev)
+        return -1;
+    ResetEvent(s_wake[free_i].ev);
+    s_wake[free_i].tid = tid;
+    s_wake[free_i].token = 0;
+    s_wake[free_i].parked = 0;
+    return free_i;
+}
+
 NTSTATUS __stdcall xbox_NtSuspendThread(
     HANDLE ThreadHandle,
     PULONG PreviousSuspendCount)
 {
     DWORD prev;
+
+    if (GetThreadId(ThreadHandle) == GetCurrentThreadId()) {
+        HANDLE ev = NULL;
+        int i;
+        AcquireSRWLockExclusive(&s_wake_lock);
+        i = wake_slot_locked(GetCurrentThreadId(), 1);
+        if (i >= 0) {
+            if (s_wake[i].token) {
+                /* Already resumed: parked and woken in the same instant. */
+                s_wake[i].token = 0;
+                ReleaseSRWLockExclusive(&s_wake_lock);
+                if (PreviousSuspendCount)
+                    *PreviousSuspendCount = 0;
+                return STATUS_SUCCESS;
+            }
+            s_wake[i].parked = 1;
+            ev = s_wake[i].ev;
+        }
+        ReleaseSRWLockExclusive(&s_wake_lock);
+        if (ev) {
+            WaitForSingleObject(ev, INFINITE);
+            if (PreviousSuspendCount)
+                *PreviousSuspendCount = 0;
+            return STATUS_SUCCESS;
+        }
+        /* No slot left: the plain suspend below. */
+    }
 
     /*
      * SuspendThread returns the previous suspend count, or (DWORD)-1 on
@@ -377,9 +491,25 @@ NTSTATUS __stdcall xbox_NtResumeThread(
     PULONG PreviousSuspendCount)
 {
     DWORD prev;
+    DWORD tid = GetThreadId(ThreadHandle);
+    int i;
 
+    AcquireSRWLockExclusive(&s_wake_lock);
+    i = tid ? wake_slot_locked(tid, 1) : -1;
+    if (i >= 0 && s_wake[i].parked) {
+        /* Parked on itself: wake it. It was suspended once. */
+        s_wake[i].parked = 0;
+        SetEvent(s_wake[i].ev);
+        ReleaseSRWLockExclusive(&s_wake_lock);
+        if (PreviousSuspendCount)
+            *PreviousSuspendCount = 1;
+        return STATUS_SUCCESS;
+    }
     /* Mirror of NtSuspendThread: (DWORD)-1 is failure, not a count. */
     prev = ResumeThread(ThreadHandle);
+    if (prev == 0 && i >= 0)
+        s_wake[i].token = 1;    /* running: about to park, owe it a wake */
+    ReleaseSRWLockExclusive(&s_wake_lock);
     if (prev == (DWORD)-1) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
             "NtResumeThread: ResumeThread failed (error %u)", GetLastError());

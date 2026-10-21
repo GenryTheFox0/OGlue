@@ -1255,6 +1255,45 @@ uint32_t xbox_Nv2aFenceWordVa(void)
 
 static void fence_mirrors_tick(void)
 {
+    /* GENRY_HONEST_FENCE: the executor writes the word from the title's own
+     * semaphore releases (nv2a_pb_exec.c); the mirror only names it. */
+    static int honest = -1;
+    if (honest < 0)
+        honest = getenv("GENRY_HONEST_FENCE") != NULL;
+    if (honest) {
+        /* GENRY_FENCE_TRACE: what the title has submitted against what the
+         * executor has released, every two seconds -- the two numbers a
+         * fence wait compares. */
+        static int trace = -1;
+        static ULONGLONG last;
+        if (trace < 0)
+            trace = getenv("GENRY_FENCE_TRACE") != NULL;
+        if (trace && g_fence_mirror_count && GetTickCount64() - last >= 2000) {
+            uint32_t dev, get_ptr;
+            last = GetTickCount64();
+            if (fence_readable(g_fence_mirrors[0].device_ptr_va, 4)) {
+                dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[0].device_ptr_va
+                                             + g_memory_offset);
+                if (fence_readable(dev + g_fence_mirrors[0].get_ptr_off, 4)
+                        && fence_readable(dev + g_fence_mirrors[0].put_off, 4)) {
+                    get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[0].get_ptr_off)
+                                                     + g_memory_offset);
+                    if (fence_readable(get_ptr, 4))
+                        fprintf(stderr, "  [FENCE] latch %08X submitted %08X released %08X"
+                                        " (dev %08X: +0x24 %08X +0x28 %08X +0x34 %08X)\n",
+                                xbox_Nv2aRegPtr(0x400B10) ? *xbox_Nv2aRegPtr(0x400B10) : 0u,
+                                *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[0].put_off)
+                                                       + g_memory_offset),
+                                *(volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset),
+                                dev,
+                                *(volatile uint32_t *)((uintptr_t)(dev + 0x24) + g_memory_offset),
+                                *(volatile uint32_t *)((uintptr_t)(dev + 0x28) + g_memory_offset),
+                                *(volatile uint32_t *)((uintptr_t)(dev + 0x34) + g_memory_offset));
+                }
+            }
+        }
+        return;
+    }
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -1473,9 +1512,32 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                          * wrap, not a rewind; the ring's bounds are learned
                          * from the lowest and highest PUT seen. */
                         static uint32_t put_lo, put_hi;
+                        extern int nv2a_pb_follow(void);
+                        extern int nv2a_pb_scan_follow(uint32_t, uint32_t, uint32_t);
+                        int followed = 0;
                         if (!put_lo || put < put_lo) put_lo = put;
                         if (put > put_hi) put_hi = put;
-                        if (last_put && put > last_put) {
+                        /* GENRY 2026-10-21 (Шрам): GENRY_PB_FOLLOW walks the
+                         * title's own JUMP at a wrap and carries a method cut
+                         * by PUT to the next kick (nv2a_pb_scan.c); the two-
+                         * piece guess below stays as its fallback. */
+                        if (last_put && put != last_put && nv2a_pb_follow()) {
+                            uint32_t budget = put > last_put
+                                            ? (put - last_put) / 4 + 0x1000u : 0x100000u;
+                            followed = nv2a_pb_scan_follow(
+                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu), budget);
+                            if (!followed) {
+                                static int told;
+                                if (told++ < 8)
+                                    fprintf(stderr, "[PB] follow lost the ring at PUT 0x%08X"
+                                                    " (last 0x%08X): two-piece scan\n",
+                                            put, last_put);
+                            }
+                        }
+                        if (followed) {
+                            /* done */
+                        } else if (last_put && put > last_put) {
                             nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                                  XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                         } else if (last_put && put < last_put) {
@@ -1861,6 +1923,22 @@ static void watch_report(void)
 
     if (now == g_watch_last)
         return;
+    {
+        /* RECOMP_WATCH_ONLY=<value>: a slot rewritten thousands of times a
+         * frame (a D3D device field) reports only the write that stores the
+         * value being hunted. */
+        static int have = -1;
+        static uint32_t only;
+        if (have < 0) {
+            const char *e = getenv("RECOMP_WATCH_ONLY");
+            have = e && *e;
+            only = have ? (uint32_t)strtoul(e, NULL, 0) : 0;
+        }
+        if (have && now != only) {
+            g_watch_last = now;
+            return;
+        }
+    }
     fprintf(stderr, "[WATCH] [%08X] %08X -> %08X  (esp=%08X)\n",
             g_watch_va, g_watch_last, now, esp);
     g_watch_last = now;

@@ -40,6 +40,7 @@ static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
 static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
+static int      s_prog_dirty = 1;        /* program words changed since decode */
 
 static int vsh_dump_enabled(void)
 {
@@ -65,6 +66,7 @@ void nv2a_vsh_program_word(uint32_t word)
 {
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
+    s_prog_dirty = 1;
     if (++s_load_word == 4) {
         s_load_word = 0;
         s_load_slot++;
@@ -116,6 +118,7 @@ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
     if (slot < NV2A_VSH_SLOTS)
         memcpy(s_program[slot], words, sizeof s_program[slot]);
+    s_prog_dirty = 1;
 }
 
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
@@ -329,7 +332,189 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     return r;
 }
 
+/* ---- the program, decoded once ------------------------------------------
+ *
+ * nv2a_vsh_run used to pull every field out of every instruction's bits for
+ * every vertex -- some forty shifts and masks an instruction before any
+ * arithmetic, for a skinned character's ten thousand vertices a frame. The
+ * fields only change when the program does, so they are decoded once into
+ * GenryVshIns and the per-vertex loop reads plain bytes. Decoding is also the
+ * one write a run would make, which is what lets the executor transform a
+ * batch's vertices on several threads (nv2a_vsh_prepare first, on one). */
+typedef struct {
+    uint8_t mux, reg, in, neg, rel;
+    uint8_t sw[4];
+    int16_t ci;
+} GenryVshSrc;
+
+typedef struct {
+    GenryVshSrc src[3];
+    uint8_t mac, ilu, mac_mask, ilu_mask, tdst, omask, out_ilu, out_reg, end;
+    uint16_t oaddr;
+} GenryVshIns;
+
+static GenryVshIns s_dec[NV2A_VSH_SLOTS];
+static int s_dec_n = -1;               /* -1: decode before the next run */
+static uint32_t s_dec_start;
+
+static void dec_src(GenryVshSrc *d, const uint32_t *ins, int which)
+{
+    uint32_t swz;
+    if (which == 0) {
+        d->neg = (uint8_t)field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
+        d->mux = (uint8_t)field(ins, 2, 26, 2); d->reg = (uint8_t)field(ins, 2, 28, 4);
+    } else if (which == 1) {
+        d->neg = (uint8_t)field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
+        d->mux = (uint8_t)field(ins, 2, 11, 2); d->reg = (uint8_t)field(ins, 2, 13, 4);
+    } else {
+        d->neg = (uint8_t)field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
+        d->mux = (uint8_t)field(ins, 3, 28, 2);
+        d->reg = (uint8_t)((field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2));
+    }
+    d->sw[0] = (uint8_t)((swz >> 6) & 3); d->sw[1] = (uint8_t)((swz >> 4) & 3);
+    d->sw[2] = (uint8_t)((swz >> 2) & 3); d->sw[3] = (uint8_t)(swz & 3);
+    d->in = (uint8_t)field(ins, 1, 9, 4);
+    d->ci = (int16_t)field(ins, 1, 13, 8);
+    d->rel = (uint8_t)field(ins, 3, 1, 1);
+}
+
+void nv2a_vsh_prepare(void)
+{
+    uint32_t s;
+    int n = 0;
+
+    if (s_dec_n >= 0 && !s_prog_dirty && s_dec_start == s_start_slot)
+        return;
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = s_program[s];
+        GenryVshIns *d = &s_dec[n++];
+        dec_src(&d->src[0], ins, 0);
+        dec_src(&d->src[1], ins, 1);
+        dec_src(&d->src[2], ins, 2);
+        d->mac = (uint8_t)field(ins, 1, 21, 4);
+        d->ilu = (uint8_t)field(ins, 1, 25, 3);
+        d->mac_mask = (uint8_t)field(ins, 3, 24, 4);
+        d->ilu_mask = (uint8_t)field(ins, 3, 16, 4);
+        d->tdst = (uint8_t)field(ins, 3, 20, 4);
+        d->omask = (uint8_t)field(ins, 3, 12, 4);
+        d->oaddr = (uint16_t)field(ins, 3, 3, 8);
+        d->out_ilu = (uint8_t)field(ins, 3, 2, 1);
+        d->out_reg = (uint8_t)field(ins, 3, 11, 1);
+        d->end = (uint8_t)field(ins, 3, 0, 1);
+        if (d->end)
+            break;
+    }
+    s_dec_start = s_start_slot;
+    s_dec_n = n;
+    s_prog_dirty = 0;
+}
+
+int nv2a_vsh_writes_constants(void)
+{
+    return s_cxt_write != 0;
+}
+
+static vec4 dec_read(const GenryVshSrc *d, const float in[NV2A_VSH_INPUTS][4],
+                     const vec4 *temp, const vec4 *opos, int a0)
+{
+    const float *s;
+    vec4 r;
+
+    if (d->mux == 1)
+        s = (d->reg == 12) ? opos->v : (d->reg < 12 ? temp[d->reg].v : temp[0].v);
+    else if (d->mux == 2)
+        s = in[d->in];
+    else {
+        int ci = d->ci + (d->rel ? a0 : 0);
+        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
+            ci = 0;
+        s = s_const[ci];
+    }
+    r.v[0] = s[d->sw[0]];
+    r.v[1] = s[d->sw[1]];
+    r.v[2] = s[d->sw[2]];
+    r.v[3] = s[d->sw[3]];
+    if (d->neg) {
+        r.v[0] = -r.v[0]; r.v[1] = -r.v[1];
+        r.v[2] = -r.v[2]; r.v[3] = -r.v[3];
+    }
+    return r;
+}
+
+/* The decoded twin of nv2a_vsh_run_slow below: the same instruction
+ * semantics, read from s_dec. */
+static int vsh_run_decoded(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+{
+    vec4 temp[12], opos;
+    float outregs[13][4];
+    int a0 = 0, k;
+
+    memset(temp, 0, sizeof temp);
+    memset(&opos, 0, sizeof opos);
+    memset(outregs, 0, sizeof outregs);
+    outregs[3][3] = outregs[4][3] = 1.0f;
+    outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
+
+    for (k = 0; k < s_dec_n; k++) {
+        const GenryVshIns *d = &s_dec[k];
+        vec4 a = dec_read(&d->src[0], in, temp, &opos, a0);
+        vec4 b = dec_read(&d->src[1], in, temp, &opos, a0);
+        vec4 c = dec_read(&d->src[2], in, temp, &opos, a0);
+        vec4 mres = {{0, 0, 0, 0}}, ires = {{0, 0, 0, 0}};
+
+        if (d->mac)
+            mres = run_mac(d->mac, a, b, c, &a0);
+        if (d->ilu)
+            ires = run_ilu(d->ilu, c);
+        if (d->mac && d->mac != 13 && d->mac_mask) {
+            float *t = d->tdst == 12 ? opos.v : (d->tdst < 12 ? temp[d->tdst].v : NULL);
+            if (t) write_masked(t, &mres, d->mac_mask);
+        }
+        if (d->ilu && d->ilu_mask) {
+            uint32_t it = d->mac ? 1u : d->tdst;
+            float *t = it == 12 ? opos.v : (it < 12 ? temp[it].v : NULL);
+            if (t) write_masked(t, &ires, d->ilu_mask);
+        }
+        if (d->omask) {
+            const vec4 *src = d->out_ilu ? &ires : &mres;
+            if (!d->out_reg) {
+                if (s_cxt_write && d->oaddr < NV2A_VSH_CONSTANTS)
+                    write_masked(s_const[d->oaddr], src, d->omask);
+            } else if (d->oaddr == 0) {
+                write_masked(opos.v, src, d->omask);
+            } else if (d->oaddr < 13) {
+                write_masked(outregs[d->oaddr], src, d->omask);
+            }
+        }
+        if (d->end) {
+            memcpy(out->pos, opos.v, sizeof out->pos);
+            memcpy(out->d0, outregs[3], sizeof out->d0);
+            memcpy(out->d1, outregs[4], sizeof out->d1);
+            memcpy(out->fog, outregs[5], sizeof out->fog);
+            memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
+            memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
+            memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
+            memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int nv2a_vsh_run_slow(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+
 int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+{
+    static int slow = -1;
+    if (slow < 0)
+        slow = getenv("GENRY_VSH_SLOW") != NULL || getenv("RECOMP_VSH_DUMP") != NULL;
+    if (slow)
+        return nv2a_vsh_run_slow(in, out);
+    nv2a_vsh_prepare();
+    return vsh_run_decoded(in, out);
+}
+
+static int nv2a_vsh_run_slow(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
     static int dump = -1;
     static uint32_t dumped[16];

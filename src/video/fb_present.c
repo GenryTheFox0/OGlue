@@ -50,6 +50,10 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+/* Set by every flip, so the window paints each frame as it lands instead of
+ * on its own 16 ms clock -- which beat against 60 Hz and doubled or dropped
+ * a frame every few seconds. */
+static HANDLE        s_present_evt;
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -121,6 +125,8 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     }
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
+    if (s_present_evt)
+        SetEvent(s_present_evt);
 }
 
 /* Title bar, the way ps3recomp's window shows it. Written by the flip,
@@ -141,20 +147,130 @@ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
 
 void xbox_FramebufferWindowFrameStats(uint32_t draws)
 {
-    InterlockedIncrement(&s_flips);
+    LONG f = InterlockedIncrement(&s_flips);
     InterlockedExchange(&s_frame_draws, (LONG)draws);
+
+    /* GENRY_FPS_LOG: the title-bar rate on stderr every 2 s, so a headless
+     * run can be measured too. */
+    {
+        static int on = -1;
+        static DWORD t0;
+        static LONG f0;
+        DWORD now;
+        if (on < 0)
+            on = getenv("GENRY_FPS_LOG") != NULL;
+        if (!on)
+            return;
+        now = GetTickCount();
+        if (!t0) {
+            t0 = now; f0 = f;
+        } else if (now - t0 >= 2000) {
+            fprintf(stderr, "  [FPS] %.1f (draws %u)\n",
+                    (f - f0) * 1000.0 / (now - t0), draws);
+            fflush(stderr);
+            t0 = now; f0 = f;
+        }
+    }
+}
+
+/* F11 / Alt+Enter: borderless fullscreen on the window's monitor and back. */
+static void fb_toggle_fullscreen(HWND h)
+{
+    static int full;
+    static WINDOWPLACEMENT prev = { sizeof(WINDOWPLACEMENT) };
+    LONG style = GetWindowLongA(h, GWL_STYLE);
+
+    if (!full) {
+        MONITORINFO mi = { sizeof(mi) };
+        if (!GetWindowPlacement(h, &prev) ||
+            !GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi))
+            return;
+        SetWindowLongA(h, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        full = 1;
+    } else {
+        SetWindowLongA(h, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(h, &prev);
+        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE |
+                     SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        full = 0;
+    }
+}
+
+/* The frame scaled to the client area at its own aspect, black bars around.
+ * Drawing it at its native size in the corner left whatever was there before
+ * in the rest of a maximized window -- the "copies" of the picture. */
+static void fb_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+{
+    RECT c;
+    int cw, ch, w, h, x, y;
+    HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+
+    GetClientRect(hwnd, &c);
+    cw = c.right - c.left;
+    ch = c.bottom - c.top;
+    if (cw <= 0 || ch <= 0)
+        return;
+    /* the largest rectangle of the frame's aspect that fits */
+    if ((long long)cw * s_fb_height > (long long)ch * s_fb_width) {
+        h = ch;
+        w = (int)((long long)ch * s_fb_width / s_fb_height);
+    } else {
+        w = cw;
+        h = (int)((long long)cw * s_fb_height / s_fb_width);
+    }
+    x = (cw - w) / 2;
+    y = (ch - h) / 2;
+    if (x > 0) {
+        RECT l = { 0, 0, x, ch }, r = { x + w, 0, cw, ch };
+        FillRect(hdc, &l, black);
+        FillRect(hdc, &r, black);
+    }
+    if (y > 0) {
+        RECT t = { 0, 0, cw, y }, b = { 0, y + h, cw, ch };
+        FillRect(hdc, &t, black);
+        FillRect(hdc, &b, black);
+    }
+    if (w == (int)s_fb_width && h == (int)s_fb_height) {
+        SetStretchBltMode(hdc, COLORONCOLOR);
+    } else {
+        SetStretchBltMode(hdc, HALFTONE);
+        SetBrushOrgEx(hdc, 0, 0, NULL);
+    }
+    StretchDIBits(hdc, x, y, w, h, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                  s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
 }
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CLOSE:
+        /* Closing the game's window quits the game. Only stopping the window
+         * left the title running headless, and the next display-mode change
+         * opened a fresh window -- a player closing it saw it come back. */
+        fprintf(stderr, "  [FBWIN] window closed: exiting\n");
+        fflush(stderr);
+        fflush(stdout);
+        TerminateProcess(GetCurrentProcess(), 0);
+        return 0;
+
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;
 
+    case WM_ERASEBKGND:
+        return 1;                     /* fb_blit paints every pixel */
+
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if (w == VK_F11 || (w == VK_RETURN && (l & (1 << 29)))) {
+            if (!(l & (1 << 30)))     /* not on auto-repeat */
+                fb_toggle_fullscreen(h);
+            return 0;                 /* Alt+Enter is not START */
+        }
         xbox_InputKeySet((int)w, 1);
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
          *
@@ -308,6 +424,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     bi.bmiHeader.biCompression = BI_RGB;
 
     s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+    if (!s_present_evt)
+        s_present_evt = CreateEventA(NULL, FALSE, FALSE, NULL);
 
     fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
             s_fb_width, s_fb_height);
@@ -326,18 +444,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            fb_blit(hwnd, hdc, &bi);
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            fb_blit(hwnd, hdc, &bi);
         }
         {
             /* One dump a few seconds in, so the title has had time to render
@@ -377,7 +491,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 t0 = now; f0 = f;
             }
         }
-        Sleep(16);
+        if (s_present_evt)
+            MsgWaitForMultipleObjects(1, &s_present_evt, FALSE, 33, QS_ALLINPUT);
+        else
+            Sleep(16);
     }
 
     ReleaseDC(hwnd, hdc);

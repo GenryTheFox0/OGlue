@@ -532,3 +532,99 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
     s_tot_jumps += jumps;
     s_tot_segments++;
 }
+
+/* GENRY 2026-10-21 (Шрам): GENRY_PB_FOLLOW -- the segment scan, made exact.
+ *
+ * Sonic Heroes drew a frame of giant triangles about once a second (team
+ * select, Seaside Hill; with the CPU raster as well as GENRY_GPU). The bad
+ * vertices all came from INLINE_ARRAY batches, and the scan above had two
+ * ways to feed those garbage:
+ *   1. a ring wrap was cut at "the highest PUT seen" and restarted at "the
+ *      lowest PUT seen" instead of at the JUMP the title wrote and its target,
+ *      so each lap lost or split a piece of the stream;
+ *   2. a kick whose PUT stops inside a method's parameters (D3D does split
+ *      inline arrays across kicks) cut the method there, and the next kick's
+ *      remaining parameters were decoded as command headers.
+ * Here the walk follows the title's JUMPs and carries an unfinished method to
+ * the next kick, like the DMA walk -- but it publishes no DMA_GET, so XDK D3D
+ * keeps the fence path that works with this runtime (see nv2a_pb_dma_walk). */
+static uint32_t s_fp_left, s_fp_i, s_fp_method, s_fp_subch;
+static int      s_fp_noninc;
+
+/* Walks from from_va up to put_va. Returns 1 when put_va was reached, 0 when
+ * the walk gave up (no JUMP back to put_va within the budget: the title reset
+ * the ring some other way) -- the caller then falls back to the old scan. */
+int nv2a_pb_scan_follow(uint32_t from_va, uint32_t put_va, uint32_t budget_words)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t va = from_va, words = 0, jumps = 0, unknown = 0;
+    int reached = 1;
+
+    if (!pb_walk_enabled())
+        return 1;
+    while (s_fp_left && va != put_va) {       /* the method the last kick stopped inside */
+        uint32_t m = s_fp_noninc ? s_fp_method : s_fp_method + s_fp_i * 4;
+        note(s_fp_subch, m);
+        if (s_exec_enabled)
+            nv2a_pb_exec_method(s_fp_subch, m, *(const uint32_t *)(mem + va));
+        va += 4; words++;
+        s_fp_i++; s_fp_left--;
+    }
+    while (va != put_va) {
+        uint32_t w;
+        if (words >= budget_words) { reached = 0; break; }
+        w = *(const uint32_t *)(mem + va);
+        va += 4; words++;
+        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {      /* JUMP */
+            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu) : (w & 0x1FFFFFFCu);
+            jumps++;
+            va = 0x80000000u | (target & 0x0FFFFFFFu);
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u)                          /* stray RETURN */
+            continue;
+        if ((w & 3u) == 2u) {                                          /* CALL */
+            uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+            s_tot_calls++;
+            words += pb_walk_segment(sub, sub + 0x400000u, 1, &jumps, &unknown);
+            continue;
+        }
+        if ((w & 0x00030003u) == 0u) {
+            uint32_t count  = (w >> 18) & 0x7FFu;
+            uint32_t subch  = (w >> 13) & 7u;
+            uint32_t method =  w & 0x1FFCu;
+            int noninc = (w & 0xE0000000u) == 0x40000000u;
+            uint32_t i;
+
+            for (i = 0; i < count; i++) {
+                uint32_t m = noninc ? method : method + i * 4;
+                if (va == put_va) {                /* PUT stopped inside: carry it on */
+                    s_fp_left = count - i; s_fp_i = i;
+                    s_fp_method = method; s_fp_subch = subch; s_fp_noninc = noninc;
+                    break;
+                }
+                note(subch, m);
+                if (s_exec_enabled)
+                    nv2a_pb_exec_method(subch, m, *(const uint32_t *)(mem + va));
+                va += 4; words++;
+            }
+            continue;
+        }
+        unknown++;
+    }
+    if (!reached)
+        s_fp_left = 0;                        /* out of step: drop the carried method */
+    s_tot_words += words;
+    s_tot_unknown += unknown;
+    s_tot_jumps += jumps;
+    s_tot_segments++;
+    return reached;
+}
+
+int nv2a_pb_follow(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("GENRY_PB_FOLLOW") != NULL;
+    return on;
+}

@@ -168,6 +168,164 @@ void xbox_IrqlDumpHolders(void)
     fflush(stderr);
 }
 
+/* One processor's worth of DISPATCH_LEVEL.
+ *
+ * On the Xbox a thread at DISPATCH_LEVEL cannot be preempted and a DPC cannot
+ * run until it lowers; a DPC that is running cannot be interrupted by any
+ * thread. XDK libraries lean on that and take no other lock: DirectSound
+ * raises IRQL around Stop and Play and frees a voice from its DPC when the
+ * hardware reports it off. Here DPCs ran on the timer thread whatever the
+ * title's threads were doing, so the DPC could free the voice a Play had just
+ * taken again: music after the first song got a voice that the next sound
+ * effect was handed too, and the song never played -- every stage's music.
+ *
+ * A recursive lock held from a thread's raise to DISPATCH_LEVEL until it
+ * lowers, and by the DPC thread around each routine, gives that exclusion
+ * back. Interrupt delivery does not take it (an ISR preempts DISPATCH_LEVEL
+ * on hardware; the device models hold off on their own). The wait is
+ * bounded: a raise that is never lowered must slow the DPCs down, not stop
+ * them for the rest of the run. GENRY_DISPATCH_LOCK=0 turns it off. */
+static CRITICAL_SECTION s_dispatch_cs;
+static INIT_ONCE s_dispatch_once = INIT_ONCE_STATIC_INIT;
+/* Each enter pushes one bit -- taken or not (timed out, or the lock is off)
+ * -- and the matching leave pops it, so nesting and a timed-out enter both
+ * pair up without releasing a lock this thread does not hold. */
+static XBOX_THREAD_LOCAL uint32_t t_dl_bits;
+static XBOX_THREAD_LOCAL int t_dl_depth;
+static XBOX_THREAD_LOCAL int t_in_isr;
+static int s_dispatch_on = -1;
+
+static BOOL CALLBACK dispatch_cs_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSectionAndSpinCount(&s_dispatch_cs, 4000);
+    return TRUE;
+}
+
+static int dispatch_take(int timeout_ms)
+{
+    ULONGLONG deadline;
+
+    if (s_dispatch_on < 0) {
+        const char *e = getenv("GENRY_DISPATCH_LOCK");
+        s_dispatch_on = !(e && *e == '0');
+    }
+    if (!s_dispatch_on)
+        return 0;
+    InitOnceExecuteOnce(&s_dispatch_once, dispatch_cs_init, NULL, NULL);
+    if (TryEnterCriticalSection(&s_dispatch_cs))
+        return 1;
+    deadline = GetTickCount64() + (ULONGLONG)timeout_ms;
+    do {
+        Sleep(0);
+        if (TryEnterCriticalSection(&s_dispatch_cs))
+            return 1;
+    } while (GetTickCount64() < deadline);
+    return 0;
+}
+
+static int dispatch_enter_timed(int timeout_ms)
+{
+    int got = dispatch_take(timeout_ms);
+    if (t_dl_depth < 32) {
+        if (got) t_dl_bits |= 1u << t_dl_depth;
+        else     t_dl_bits &= ~(1u << t_dl_depth);
+    } else if (got) {
+        LeaveCriticalSection(&s_dispatch_cs);   /* too deep to pair: give back */
+        got = 0;
+    }
+    t_dl_depth++;
+    return got;
+}
+
+static void dispatch_enter(void)
+{
+    if (!dispatch_enter_timed(50) && s_dispatch_on > 0) {
+        static volatile LONG n;
+        if (InterlockedIncrement(&n) <= 5) {
+            fprintf(stderr, "  [IRQL] tid %lu: DISPATCH_LEVEL held for 50 ms by"
+                    " another thread, going ahead without it\n",
+                    (unsigned long)GetCurrentThreadId());
+            fflush(stderr);
+        }
+    }
+}
+
+static void dispatch_leave(void)
+{
+    if (t_dl_depth <= 0)
+        return;
+    t_dl_depth--;
+    if (t_dl_depth < 32 && (t_dl_bits & (1u << t_dl_depth))) {
+        t_dl_bits &= ~(1u << t_dl_depth);
+        LeaveCriticalSection(&s_dispatch_cs);
+    }
+}
+
+/* For device models delivering an interrupt from a thread of their own: take
+ * the processor (wait out a thread at DISPATCH_LEVEL, or a DPC) before the
+ * service routine runs, the way the routine would have found the one CPU.
+ * Returns 1 if taken; either way pair it with xbox_DispatchLockLeave. */
+int xbox_DispatchLockEnter(int timeout_ms)
+{
+    return dispatch_enter_timed(timeout_ms);
+}
+
+void xbox_DispatchLockLeave(void)
+{
+    dispatch_leave();
+}
+
+/* What a processor does when IRQL drops below DISPATCH_LEVEL: take the
+ * interrupt that was held off and run the DPCs it queued, before the thread
+ * goes on.
+ *
+ * Here they waited for the APU frame thread (an interrupt) and the timer
+ * thread (its DPC), 1 to 10 ms later, while the title carried on. DirectSound
+ * stops a voice, and when CRI's music thread then plays the next song on the
+ * same buffer, the late DPC reads the stop's notifier as "this voice just
+ * ended" and releases the voice under the new song: the next sound effect
+ * is handed it and the song never plays. On hardware the DPC has run by the
+ * time Stop returns. GENRY_IRQL_SERVICE=0 turns it off. */
+static void (*volatile s_apu_lower_hook)(void);
+static XBOX_THREAD_LOCAL int t_in_service;
+static int s_lower_service_on = -1;
+extern void xbox_DrainDpcsInline(void);           /* kernel_bridge.c */
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp, g_seh_ebp;
+
+void xbox_SetApuIrqlLowerHook(void (*fn)(void))
+{
+    s_apu_lower_hook = fn;
+}
+
+static void irql_lowered_service(void)
+{
+    void (*apu)(void);
+    uint32_t r[10];
+
+    if (t_in_service || !g_fs_base)
+        return;
+    if (s_lower_service_on < 0) {
+        const char *e = getenv("GENRY_IRQL_SERVICE");
+        s_lower_service_on = !(e && *e == '0');
+    }
+    if (!s_lower_service_on)
+        return;
+    t_in_service = 1;
+    /* The thread is in the middle of a kernel call: what runs here is
+     * guest code on its stack, and the caller's registers come back as
+     * they were. */
+    r[0] = g_eax; r[1] = g_ecx; r[2] = g_edx; r[3] = g_ebx; r[4] = g_esi;
+    r[5] = g_edi; r[6] = g_esp; r[7] = g_ebp; r[8] = g_seh_ebp;
+    apu = s_apu_lower_hook;
+    if (apu)
+        apu();
+    xbox_DrainDpcsInline();
+    g_eax = r[0]; g_ecx = r[1]; g_edx = r[2]; g_ebx = r[3]; g_esi = r[4];
+    g_edi = r[5]; g_esp = r[6]; g_ebp = r[7]; g_seh_ebp = r[8];
+    t_in_service = 0;
+}
+
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
@@ -176,6 +334,15 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 
     if (now == was)
         return;
+
+    if (!t_in_isr) {
+        if (now) {
+            dispatch_enter();
+        } else {
+            irql_lowered_service();
+            dispatch_leave();
+        }
+    }
 
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
@@ -214,6 +381,11 @@ int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
     if (g_current_irql != (KIRQL)level) {
+        /* An ISR (above DISPATCH_LEVEL) does not wait for the dispatch
+         * lock; a DPC (at it) does. Saved in the high bits, restored by the
+         * matching leave. */
+        saved |= t_in_isr << 8;
+        t_in_isr = level > DISPATCH_LEVEL;
         irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
         g_current_irql = (KIRQL)level;
         irql_publish();
@@ -223,10 +395,12 @@ int xbox_IrqlEnterInterrupt(int level)
 
 void xbox_IrqlLeaveInterrupt(int saved)
 {
-    if (g_current_irql != (KIRQL)saved) {
-        irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
-        g_current_irql = (KIRQL)saved;
+    KIRQL to = (KIRQL)(saved & 0xFF);
+    if (g_current_irql != to) {
+        irql_track(g_current_irql, to, IRQL_CALLER());
+        g_current_irql = to;
         irql_publish();
+        t_in_isr = (saved >> 8) & 1;
     }
 }
 

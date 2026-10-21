@@ -248,6 +248,11 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
+    {   /* GENRY_APU_STARVE: which slices of the period this frame filled */
+        extern unsigned g_genry_slices, g_genry_slice_mask;
+        g_genry_slices++;
+        g_genry_slice_mask |= 1u << (d->ep_frame_div % 8);
+    }
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.

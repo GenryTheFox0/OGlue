@@ -2665,11 +2665,91 @@ static int s_gg_active;
 /* The stages as they were when the batch began, for the decode callbacks. */
 static Texture s_gg_tex[4];
 
+/* GENRY 2026-10-21 (Шрам): the formats a movie frame and most level textures
+ * arrive in, decoded a row at a time. sample_tex per texel rebuilt the
+ * swizzle masks and deposited both coordinates bit by bit for every texel:
+ * half the executor's time while Shadow the Hedgehog plays a Sofdec movie (a
+ * 512x512 and a 1024x512 texture rewritten every frame), and the movie ran
+ * at 16 fps. The masked increment walks the same Morton offsets
+ * swizzle_offset() deposits (xbox_unswizzle_rect does the same). Exactly
+ * sample_tex's texels; 0 for a format it does not take. */
+static int gg_decode_fast(const Texture *t, uint32_t fo, uint32_t *argb)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint8_t *base = mem + t->offset + fo;
+    uint32_t w = t->width, h = t->height, x, y, mask_x, mask_y, off_x, off_y;
+
+    switch (t->color) {
+    case 0x12:                                      /* LIN_A8R8G8B8 */
+    case 0x1E: {                                    /* LIN_X8R8G8B8 */
+        uint32_t or_a = t->color == 0x1E ? 0xFF000000u : 0u;
+        for (y = 0; y < h; y++) {
+            const uint32_t *row = (const uint32_t *)(base + (size_t)y * t->pitch);
+            uint32_t *out = argb + (size_t)y * w;
+            for (x = 0; x < w; x++)
+                out[x] = row[x] | or_a;
+        }
+        return 1;
+    }
+    case 0x06:                                      /* SZ_A8R8G8B8 */
+    case 0x07:                                      /* SZ_X8R8G8B8 */
+        break;
+    case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
+        if (!t->palette)
+            return 0;
+        break;
+    default:
+        return 0;
+    }
+    xbox_swizzle_masks(w, h, &mask_x, &mask_y);
+    for (y = 0, off_y = 0; y < h; y++, off_y = (off_y - mask_y) & mask_y) {
+        uint32_t *out = argb + (size_t)y * w;
+        if (t->color == 0x0B) {
+            const uint32_t *pal = (const uint32_t *)(mem + t->palette);
+            for (x = 0, off_x = 0; x < w; x++, off_x = (off_x - mask_x) & mask_x)
+                out[x] = pal[base[off_y | off_x]];
+        } else {
+            const uint32_t *p = (const uint32_t *)base;
+            uint32_t or_a = t->color == 0x07 ? 0xFF000000u : 0u;
+            for (x = 0, off_x = 0; x < w; x++, off_x = (off_x - mask_x) & mask_x)
+                out[x] = p[off_y | off_x] | or_a;
+        }
+    }
+    return 1;
+}
+
 static int gg_decode_cb(const void *ctx, uint32_t face, uint32_t *argb)
 {
     const Texture *t = (const Texture *)ctx;
     uint32_t x, y, fo = face ? face * tex_face_stride(t) : 0;
 
+    if (t->valid && gg_decode_fast(t, fo, argb)) {
+        /* GENRY_DECODE_CHECK=1: the slow path beside it, texel for texel. */
+        static int check = -1;
+        static unsigned checked, bad;
+        if (check < 0) check = getenv("GENRY_DECODE_CHECK") != NULL;
+        if (check && checked < 2000) {
+            size_t n = (size_t)t->width * t->height, i;
+            uint32_t *ref = (uint32_t *)malloc(n * 4);
+            if (ref) {
+                int ok = 1;
+                for (y = 0; y < t->height && ok; y++)
+                    for (x = 0; x < t->width; x++)
+                        if (!sample_tex(t, fo, x, y, &ref[(size_t)y * t->width + x])) { ok = 0; break; }
+                for (i = 0; ok && i < n; i++)
+                    if (ref[i] != argb[i]) {
+                        if (bad++ < 10)
+                            fprintf(stderr, "[DECODE-CHECK] fmt %02X %ux%u texel %zu fast %08X slow %08X%c",
+                                    t->color, t->width, t->height, i, argb[i], ref[i], 10);
+                        break;
+                    }
+                free(ref);
+            }
+            if (++checked % 200 == 0)
+                fprintf(stderr, "[DECODE-CHECK] %u textures, %u differ%c", checked, bad, 10);
+        }
+        return 1;
+    }
     for (y = 0; y < t->height; y++)
         for (x = 0; x < t->width; x++)
             if (!sample_tex(t, fo, x, y, &argb[(size_t)y * t->width + x]))
@@ -2928,7 +3008,14 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     float k[3], o[3], ca[3], cb[3];
     int n = 0, i, j;
 
-    if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
+    /* GENRY 2026-10-21 (Шрам): any w > 0 is in front of the eye, as on the
+     * hardware (xemu only clamps w away from zero). Shadow the Hedgehog
+     * starts every 3D frame with a screen-space quad at w = 1e-6, depth func
+     * ALWAYS, z = 2^24: the colour and depth clear. Testing against
+     * NV_CLIP_W dropped it as "wholly behind", the depth buffer was never
+     * reset, and every level draw after it failed the depth test (white
+     * world). NV_CLIP_W stays the plane a w <= 0 vertex is clipped to. */
+    if (a->pos[3] > 0.0f && b->pos[3] > 0.0f && c->pos[3] > 0.0f) {
         raster_xf_triangle(a, b, c);
         return;
     }
@@ -4394,6 +4481,55 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                 xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
                 xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+            }
+        }
+        {
+            /* GENRY 2026-10-21 (Шрам): GENRY_VIDEO_FPS=1 -- once a second,
+             * flips and how many of them showed a different picture (a 64x48
+             * sample of the presented surface). A movie player flips at the
+             * display rate and changes the picture at the movie's; dumping
+             * every flip to measure that slows the game down by itself. */
+            static int on = -1;
+            static uint64_t last_hash;
+            static uint32_t prev[48 * 64];
+            static unsigned flips, changes, big;
+            static DWORD t0;
+            if (on < 0) on = getenv("GENRY_VIDEO_FPS") != NULL;
+            if (on) {
+                uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
+                uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
+                uint32_t w = s_gpu.drawn_offset ? s_gpu.drawn_w : s_gpu.clip_w;
+                uint32_t h = s_gpu.drawn_offset ? s_gpu.drawn_h : s_gpu.clip_h;
+                uint64_t hash = 1469598103934665603ull, diff = 0;
+                DWORD now = GetTickCount();
+                if (done && pitch && w && h) {
+                    const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset() + dma_resolve(done);
+                    for (uint32_t sy = 0; sy < 48; sy++)
+                        for (uint32_t sx = 0; sx < 64; sx++) {
+                            uint32_t v, o, c;
+                            memcpy(&v, m + (sy * h / 48) * pitch + (sx * w / 64) * 4, 4);
+                            hash = (hash ^ v) * 1099511628211ull;
+                            o = prev[sy * 64 + sx];
+                            for (c = 0; c < 24; c += 8) {
+                                int a = (int)((v >> c) & 0xFF) - (int)((o >> c) & 0xFF);
+                                diff += (uint64_t)(a < 0 ? -a : a);
+                            }
+                            prev[sy * 64 + sx] = v;
+                        }
+                }
+                flips++;
+                if (hash != last_hash) changes++;
+                /* mean change over 1 level per channel: a new picture, not
+                 * dither or a blinking cursor */
+                if (diff > 48ull * 64 * 3) big++;
+                last_hash = hash;
+                if (!t0) t0 = now;
+                if (now - t0 >= 1000) {
+                    fprintf(stderr, "[VFPS] %u flips, %u different pictures, %u new in %.2f s%c",
+                            flips, changes, big, (now - t0) / 1000.0, 10);
+                    flips = changes = big = 0;
+                    t0 = now;
+                }
             }
         }
         {

@@ -39,6 +39,9 @@ static void mixer_init(void);
 static void mixer_render(int16_t frame_buf[][2], int num_samples);
 static APUMixerVoice g_mixer_voices[APU_MIXER_MAX_VOICES];
 static volatile int g_mixer_active_count = 0;
+/* GENRY 2026-10-21 (Шрам): the title itself switched the sequencer on
+ * (SECTL/FECTL write), so the VP/DSP pipeline is what feeds the device. */
+static bool s_title_started_apu;
 static CRITICAL_SECTION g_mixer_cs;
 static bool g_mixer_initialized = false;
 struct McpxApuDebug g_dbg;
@@ -422,6 +425,14 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
+        if (addr == NV_PAPU_SECTL) {   /* GENRY_APU_STARVE: what SECTL is set to */
+            static int on = -1;
+            static unsigned n;
+            if (on < 0) on = getenv("GENRY_APU_STARVE") != NULL;
+            if (on && n++ < 40)
+                fprintf(stderr, "[APU-SECTL] %08X -> %08X%c",
+                        qatomic_read(&d->regs[NV_PAPU_SECTL]), (uint32_t)val, 10);
+        }
         qatomic_set(&d->regs[addr], (uint32_t)val);
         /* Starting the APU has to start the frame thread.
          *
@@ -445,6 +456,7 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
                     != NV_PAPU_FECTL_FEMETHMODE_HALTED);
             if (running && d->pause_requested) {
                 d->pause_requested = false;
+                s_title_started_apu = true;
                 fprintf(stderr, "[APU] started by the title"
                                 " (SECTL=%08X FECTL=%08X)\n", sectl, fectl);
             }
@@ -880,6 +892,8 @@ static void waveout_submit(MCPXAPUState *d, const int16_t period[][2])
  * This used to clear frame_buf before rendering the tone and the mixer into
  * it, so whatever the VP and DSP produced never reached the device, and it
  * rendered a whole device buffer (1024 samples) per 256-sample period. */
+unsigned g_genry_slices, g_genry_slice_mask;   /* apu_dsp.c fills */
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     int16_t period[MIXER_FRAME_SAMPLES][2];
@@ -890,6 +904,30 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     }
 
     memcpy(period, d->monitor.frame_buf, sizeof(period));
+    {   /* GENRY_APU_STARVE: a period handed over all silent, and why */
+        static int on = -1;
+        static unsigned zero_periods, periods, logged;
+        if (on < 0) on = getenv("GENRY_APU_STARVE") != NULL;
+        if (on) {
+            int nz = 0;
+            for (int i = 0; i < MIXER_FRAME_SAMPLES && !nz; i++)
+                nz = period[i][0] | period[i][1];
+            periods++;
+            static int heard;
+            if (nz) heard = 1;
+            if (!nz) {
+                zero_periods++;
+                if (heard && logged++ < 60)
+                    fprintf(stderr, "[APU-ZERO] period %u div %d slices %u mask %02X point %d%c",
+                            periods, d->ep_frame_div, g_genry_slices,
+                            g_genry_slice_mask, (int)d->monitor.point, 10);
+            }
+            if (periods % 1875 == 0)
+                fprintf(stderr, "[APU-ZERO] %u of %u periods silent%c", zero_periods, periods, 10);
+        }
+        g_genry_slices = 0;
+        g_genry_slice_mask = 0;
+    }
     /* The VP monitor point accumulates into frame_buf, so the next period
      * has to start from silence. */
     memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
@@ -1041,6 +1079,8 @@ void mcpx_apu_pace_rendered(MCPXAPUState *d)
     d->next_frame_time_us += EP_FRAME_US;
 }
 
+extern int g_genry_apu_burst;   /* apu_vp.c */
+
 static void throttle(MCPXAPUState *d)
 {
     int64_t start_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
@@ -1050,6 +1090,7 @@ static void throttle(MCPXAPUState *d)
             d, qemu_clock_get_us(QEMU_CLOCK_REALTIME));
         if (wait_us <= 0)
             break;
+        g_genry_apu_burst = 0;      /* GENRY_APU_STARVE: a burst ends here */
         qemu_cond_timedwait(&d->cond, &d->lock,
                             (int)((wait_us + 999) / 1000));
     }
@@ -1079,6 +1120,7 @@ static void se_frame(MCPXAPUState *d)
     }
     d->frame_count++;
     apu_irq_stats.se_frames++;
+    g_genry_apu_burst++;
 
     /* Buffer for all mixbins for this frame */
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
@@ -1188,6 +1230,19 @@ static void *mcpx_apu_frame_thread(void *arg)
              * zero in streamed music every few seconds). The interrupt is
              * delivered below; the wait is after it. */
             apu_irq_stats.fe_trapped_frames++;
+        } else if (s_title_started_apu && !g_test_tone.active &&
+                   !g_mixer_active_count) {
+            /* GENRY 2026-10-21 (Шрам): XCNTMODE off on an APU the title
+             * started: wait, as xemu's frame thread does, and render the
+             * period once the sequencer is back on. Shadow the Hedgehog
+             * (XDK 5849) writes SECTL 0x0F -> 0x07 -> 0x0F about 120 times a
+             * second while it resets the GP; the lightweight branch below
+             * handed the device a silent period every time it caught the
+             * register off -- 30 % of the music and the Sofdec audio came
+             * out as 256/512-sample holes (the crackle), and the voice
+             * position the movie player syncs to advanced that much slower.
+             * The device queue rides out the pause; pacing refills it. */
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);

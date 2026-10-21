@@ -1457,6 +1457,61 @@ done:
  * Voice processing (main per-voice function)
  * ============================================================ */
 
+/* GENRY 2026-10-21 (Шрам): GENRY_APU_STARVE=1 -- once a VP second, every
+ * active voice that came up short of a whole frame (its stream ran dry or
+ * its data ended), with how deep into a render burst it happened: the frame
+ * thread renders ahead of the device clock in bursts (mcpx_apu_pace_step),
+ * and a title that refills a stream from the packet-done interrupt cannot
+ * refill in the middle of a burst. Shadow the Hedgehog's music and Sofdec
+ * audio came out with 256/512-sample holes about 20 times a second. */
+int g_genry_apu_burst;
+static int s_starve_on = -1;
+static unsigned s_starve_frames;
+static struct { uint32_t shorts, missing, b0, b1, b8, fmt, paused, pb0; } s_starve[MCPX_HW_MAX_VOICES];
+static unsigned s_burst_max;
+
+static void genry_starve_note(MCPXAPUState *d, uint16_t v, int sample_count)
+{
+    if (s_starve_on < 0) s_starve_on = getenv("GENRY_APU_STARVE") != NULL;
+    if (!s_starve_on || sample_count >= NUM_SAMPLES_PER_FRAME) return;
+    if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+        return;
+    s_starve[v].shorts++;
+    s_starve[v].missing += (uint32_t)(NUM_SAMPLES_PER_FRAME - sample_count);
+    s_starve[v].fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu);
+    if (g_genry_apu_burst == 0) s_starve[v].b0++;
+    else if (g_genry_apu_burst < 8) s_starve[v].b1++;
+    else s_starve[v].b8++;
+}
+
+static void genry_pause_note(MCPXAPUState *d, uint16_t v)
+{
+    if (s_starve_on < 0) s_starve_on = getenv("GENRY_APU_STARVE") != NULL;
+    if (!s_starve_on) return;
+    s_starve[v].paused++;
+    if (g_genry_apu_burst == 0) s_starve[v].pb0++;
+    s_starve[v].fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu);
+}
+
+static void genry_starve_report(void)
+{
+    if (s_starve_on <= 0) return;
+    if ((unsigned)g_genry_apu_burst > s_burst_max) s_burst_max = (unsigned)g_genry_apu_burst;
+    if (++s_starve_frames % 1500) return;
+    fprintf(stderr, "[APU-STARVE] t=%us burst_max=%u frames", s_starve_frames / 1500, s_burst_max);
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+        if (!s_starve[v].shorts && !s_starve[v].paused) continue;
+        fprintf(stderr, " | v%u fmt %08X short %u missing %u burst@0 %u @1-7 %u @8+ %u paused %u (@0 %u)", v,
+                s_starve[v].fmt, s_starve[v].shorts, s_starve[v].missing,
+                s_starve[v].b0, s_starve[v].b1, s_starve[v].b8,
+                s_starve[v].paused, s_starve[v].pb0);
+        memset(&s_starve[v], 0, sizeof(s_starve[v]));
+    }
+    fputc('\n', stderr);
+    s_burst_max = 0;
+}
+
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
                           float sample_buf[NUM_SAMPLES_PER_FRAME][2],
@@ -1474,7 +1529,10 @@ static void voice_process(MCPXAPUState *d,
     dbg->stereo = stereo;
     dbg->paused = paused;
 
-    if (paused) return;
+    if (paused) {
+        genry_pause_note(d, v);
+        return;
+    }
 
     /* Step filter envelope */
     float ef_value = voice_step_envelope(
@@ -1523,8 +1581,8 @@ static void voice_process(MCPXAPUState *d,
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
         }
     } else {
-        int empty = 0;
-        for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
+        int empty = 0, sample_count = 0;
+        for (; sample_count < NUM_SAMPLES_PER_FRAME;) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
             if (!active) return;
@@ -1538,6 +1596,7 @@ static void voice_process(MCPXAPUState *d,
             if (count == 0 && ++empty > 4) break;
             sample_count += count;
         }
+        genry_starve_note(d, v, sample_count);
     }
 
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
@@ -1739,6 +1798,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
     vp_trace_positions(d);
     vp_stat_report();
+    genry_starve_report();
     if (s_ring_on > 0 && ++s_ring_frames % 1500 == 0)
         vp_ring_report(++s_ring_secs);
 

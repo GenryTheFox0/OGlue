@@ -47,9 +47,44 @@ static int g_apu_mmio_decode_fail = 0;
  * 8-byte access (the decoder emits size 8 for REX.W) is two 4-byte accesses
  * here; handing it over whole drops the high dword on a store and returns
  * zero for it on a load. The POSIX arm64 hook below splits the same way. */
+/* GENRY 2026-10-21 (Шрам): GENRY_APU_MMIO_STATS=1 -- раз в 2 с сколько ловушек на регистры APU
+ * и какие регистры самые горячие. Каждое обращение = исключение процессора и разбор команды;
+ * Shadow the Hedgehog (XDK 5849) во время роликов сидел в этом пути и показывал 2 кадра в секунду. */
+static uint32_t s_apu_hits[APU_MMIO_SIZE / 4][2];
+static void apu_mmio_stat(uint32_t off, int is_write)
+{
+    static int on = -1;
+    static ULONGLONG t0;
+    if (on < 0) on = getenv("GENRY_APU_MMIO_STATS") != NULL;
+    if (!on || off >= APU_MMIO_SIZE) return;
+    s_apu_hits[off >> 2][is_write]++;
+    ULONGLONG now = GetTickCount64();
+    if (!t0) t0 = now;
+    if (now - t0 < 2000) return;
+    t0 = now;
+    uint32_t best[8] = {0}, bn[8] = {0}, bw[8] = {0}, total = 0, i, k;
+    for (i = 0; i < APU_MMIO_SIZE / 4; i++)
+        for (int w = 0; w < 2; w++) {
+            uint32_t n = s_apu_hits[i][w];
+            if (!n) continue;
+            total += n;
+            for (k = 0; k < 8; k++)
+                if (n > bn[k]) {
+                    for (uint32_t m = 7; m > k; m--) { bn[m] = bn[m-1]; best[m] = best[m-1]; bw[m] = bw[m-1]; }
+                    bn[k] = n; best[k] = i << 2; bw[k] = (uint32_t)w; break;
+                }
+            s_apu_hits[i][w] = 0;
+        }
+    fprintf(stderr, "[APU-MMIO] %u traps / 2 s; top:", total);
+    for (k = 0; k < 8 && bn[k]; k++)
+        fprintf(stderr, " %s+0x%05X x%u", bw[k] ? "W" : "R", best[k], bn[k]);
+    fprintf(stderr, "\n");
+}
+
 static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
 {
     g_apu_mmio_read_count++;
+    apu_mmio_stat(off, 0);
     if (size == 8) {
         uint64_t lo = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, 4);
         uint64_t hi = mcpx_apu_mmio_read((MCPXAPUState *)dev, off + 4, 4);
@@ -61,6 +96,7 @@ static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
 static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
 {
     g_apu_mmio_write_count++;
+    apu_mmio_stat(off, 1);
     if (size == 8) {
         mcpx_apu_mmio_write((MCPXAPUState *)dev, off, (uint32_t)v, 4);
         mcpx_apu_mmio_write((MCPXAPUState *)dev, off + 4, (uint32_t)(v >> 32), 4);
@@ -116,6 +152,22 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
         }
     }
     return ok;
+}
+
+/* GENRY 2026-10-21 (Шрам): тот же регистр APU, но без исключения -- для переведённого кода,
+ * который знает, что лезет в окно APU (game/src/recomp/genry_mmio.h + tools/dsound_mmio_pass.py).
+ * Без модели APU (RECOMP_AC97_READY выключен) чтение даёт 0, запись теряется -- как и раньше,
+ * когда окно не было защищено и никто его не слушал. */
+uint32_t genry_apu_mmio_read(uint32_t va, int size)
+{
+    if (!g_apu_state) return 0;
+    return (uint32_t)apu_mmio_rd(g_apu_state, va - APU_MMIO_BASE, size);
+}
+
+void genry_apu_mmio_write(uint32_t va, uint32_t value, int size)
+{
+    if (!g_apu_state) return;
+    apu_mmio_wr(g_apu_state, va - APU_MMIO_BASE, value, size);
 }
 
 #endif /* _WIN32 */

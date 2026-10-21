@@ -16,6 +16,9 @@
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
+#if defined(_MSC_VER)
+#pragma comment(lib, "Synchronization.lib")   /* WaitOnAddress */
+#endif
 
 /* ============================================================================
  * String Initialization
@@ -203,6 +206,8 @@ typedef struct {
     volatile uint32_t      owner_site;
     volatile unsigned long owner_tid;
     volatile long          depth;
+    /* GENRY 2026-10-21 (Шрам): first come, first served (xbox_cs_fair). */
+    volatile LONG          ticket_next, ticket_serving;
 } XBOX_CS_SLOT;
 
 static XBOX_CS_SLOT g_cs_table[XBOX_CS_TABLE_SIZE];
@@ -470,6 +475,45 @@ static void xbox_cs_clear_owner(CRITICAL_SECTION* cs)
     }
 }
 
+/* GENRY 2026-10-21 (Шрам): guest locks are handed over in arrival order.
+ *
+ * On the console one CPU runs the title, so a thread that leaves a lock a
+ * higher-priority thread is waiting on is preempted by it at once (KeSetEvent
+ * readies the waiter) and cannot take the lock straight back. Here the waiter
+ * wakes on another core microseconds later, and a thread that leaves and
+ * re-enters in a loop wins every time: Shadow the Hedgehog's main thread
+ * took CRI's lock about a million times a second while three CRI threads
+ * (Sofdec decode, ADX server, file server) queued behind it -- the story
+ * movie showed 2-4 of its 30 pictures a second and its sound ring replayed
+ * old laps. A ticket per outermost Enter, served in order, restores what the
+ * console guarantees; the host lock behind it is then always free when a
+ * ticket comes up. Recursive entry by the holder takes no ticket.
+ * GENRY_FAIR_CS=0 goes back to plain host critical sections. */
+static int xbox_cs_fair(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("GENRY_FAIR_CS");
+        on = !(e && atoi(e) == 0);
+    }
+    return on;
+}
+
+static void xbox_cs_wait_turn(XBOX_CS_SLOT* slot, LONG ticket)
+{
+    int spins = 0;
+    for (;;) {
+        LONG now = slot->ticket_serving;
+        if ((LONG)(now - ticket) >= 0)     /* our turn (or, after a stray */
+            return;                        /* leave, past it: never hang) */
+        if (++spins < 2000) {
+            YieldProcessor();
+            continue;
+        }
+        WaitOnAddress(&slot->ticket_serving, &now, sizeof now, INFINITE);
+    }
+}
+
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
@@ -477,6 +521,18 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         return;
     InterlockedIncrement(&g_cs_enters);
     crt_lock_trace("take", CriticalSection);
+    {
+        XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
+        if (slot && xbox_cs_fair()) {
+            if (slot->owner_tid != GetCurrentThreadId()) {
+                LONG ticket = InterlockedIncrement(&slot->ticket_next) - 1;
+                xbox_cs_wait_turn(slot, ticket);
+            }
+            EnterCriticalSection(cs);
+            xbox_cs_note_owner(cs);
+            return;
+        }
+    }
     if (TryEnterCriticalSection(cs)) {
         xbox_cs_note_owner(cs);
         return;
@@ -525,9 +581,22 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (cs) {
+        XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
         InterlockedIncrement(&g_cs_leaves);
         crt_lock_trace("drop", CriticalSection);
         xbox_cs_clear_owner(cs);
+        if (slot && xbox_cs_fair() && slot->depth == 0) {
+            /* the outermost leave: next ticket's turn */
+            LONG serving = slot->ticket_serving;
+            LeaveCriticalSection(cs);
+            /* A leave with no ticket out (unbalanced, or the lock taken
+             * before fairness was read) must not move the queue past a
+             * ticket nobody has drawn yet. */
+            if (serving != slot->ticket_next)
+                InterlockedCompareExchange(&slot->ticket_serving, serving + 1, serving);
+            WakeByAddressAll((PVOID)&slot->ticket_serving);
+            return;
+        }
         LeaveCriticalSection(cs);
     }
 }

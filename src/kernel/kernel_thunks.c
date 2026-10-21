@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#if defined(_WIN32)
+#include <timeapi.h>   /* timeBeginPeriod (winmm) */
+#endif
 
 extern ptrdiff_t g_xbox_mem_offset;
 
@@ -397,6 +400,32 @@ void xbox_kernel_init(void)
     ULONG unresolved = 0;
     uint32_t thunk_base = 0;
     uint32_t thunk_count = 0;
+
+#if defined(_WIN32)
+    /* GENRY 2026-10-21 (Шрам): 1 ms timer resolution for the whole process.
+     * KeDelayExecutionThread and every guest wait with a timeout end in a
+     * Win32 Sleep/Wait, and Windows 11 gives a process that does not ask the
+     * default 15.6 ms tick: a title thread that works and then sleeps 1 ms
+     * slept 15. Shadow the Hedgehog's Sofdec movie player and CRI's sound
+     * server do exactly that -- the story movie showed about 17 of its 30
+     * pictures a second and its music ring fell behind and replayed old
+     * laps. GENRY_TIMER_1MS=0 leaves the default. The power-throttling call
+     * keeps the resolution (and full speed) while the window is hidden or
+     * minimized; Windows 10 without it just ignores the request. */
+    {
+        const char *t = getenv("GENRY_TIMER_1MS");
+        if (!t || atoi(t) != 0) {
+            typedef struct { ULONG Version, ControlMask, StateMask; } GgPowerThrottling;
+            typedef BOOL (WINAPI *SetProcInfo)(HANDLE, int, LPVOID, DWORD);
+            GgPowerThrottling pt = { 1, 0x1 | 0x4, 0 };   /* EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION, both off */
+            SetProcInfo spi = (SetProcInfo)(void *)GetProcAddress(
+                GetModuleHandleA("kernel32.dll"), "SetProcessInformation");
+            if (spi)
+                spi(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &pt, sizeof pt);
+            timeBeginPeriod(1);
+        }
+    }
+#endif
 
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);

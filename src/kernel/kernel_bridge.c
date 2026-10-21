@@ -25,6 +25,7 @@
  *   different parameter layouts (pointer vs value), so each needs its own bridge.
  */
 
+#include "genry_movie_skip.h"
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "kernel_missing.h"
@@ -954,6 +955,7 @@ static void bridge_NtClose(void)
 
     bridge_forget_async_handle(raw_handle);
     thobj_detach_token(raw_handle);
+    genry_movie_closed(raw_handle);
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
@@ -3562,7 +3564,12 @@ static NTSTATUS bridge_create_file_impl(
             if (name.Buffer)
                 xbox_missing_note(gpath, status, (uint32_t)access,
                                   (uint32_t)disposition, (uint32_t)options, 0);
-        } else if (ntcreate || xbox_missing_verbose())
+        } else {
+            /* GENRY_MOVIE_SKIP: a movie file is what A can cut short */
+            if (handle_va)
+                genry_movie_opened(BRIDGE_MEM32(handle_va), gpath);
+        }
+        if (!status && (ntcreate || xbox_missing_verbose()))
             fprintf(stderr, "  [FILE] %s (disp %u opts 0x%X from 0x%08X) -> 0x%08X h=%08X\n",
                     gpath, (unsigned)disposition, (unsigned)options,
                     g_xbox_kernel_caller, status,
@@ -4005,8 +4012,14 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
-    g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(buffer_va), length, poff);
+    if (genry_movie_read(STACK_ARG(0))) {
+        /* the player held A: the movie file has ended */
+        ios.Status = (NTSTATUS)0xC0000011;           /* STATUS_END_OF_FILE */
+        ios.Information = 0;
+        g_eax = 0xC0000011u;
+    } else
+        g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                    XBOX_TO_NATIVE(buffer_va), length, poff);
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look

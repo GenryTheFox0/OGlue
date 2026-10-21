@@ -123,6 +123,10 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             memset(dst, 0, (size_t)s_fb_width * 4);
         }
     }
+    {   /* GENRY_MOVIE_SKIP: the hold-A ring, on the window copy only */
+        extern void genry_movie_overlay(uint32_t *argb, uint32_t w, uint32_t h);
+        genry_movie_overlay(s_present[next], s_fb_width, s_fb_height);
+    }
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
     if (s_present_evt)

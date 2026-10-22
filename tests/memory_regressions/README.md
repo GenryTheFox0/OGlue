@@ -17,6 +17,7 @@ One test per mode, one process each, because the switches are read once and cach
 |---|---|
 | `memory_regressions_default` | No switch set. Pins what every title gets today: reuse hands a freed block over whole, contiguous memory is never reused, an explicit high base is not honoured. A change to the default fails here. |
 | `memory_regressions_heap_reclaim` | `RECOMP_HEAP_RECLAIM=1`. The first table below. |
+| `memory_regressions_contig_avoid_image` | `RECOMP_CONTIG_AVOID_IMAGE=1`: a contiguous block lands outside the loaded image. The default and heap-reclaim modes check that a block still fills from the bottom. |
 | `memory_regressions_ext_vma` | `RECOMP_EXT_VMA=1`. The second table. |
 | `memory_regressions_ext_vma_128` | `RECOMP_EXT_VMA=1` on a 128 MB map. The tracker stays off. |
 

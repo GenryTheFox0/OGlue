@@ -55,6 +55,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
+extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 enum { S_ALLOC, S_FREE, S_QUERY, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
@@ -185,13 +186,14 @@ int main(int argc, char **argv)
     int reclaim = !strcmp(mode, "heap-reclaim");
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
+    int avoid = !strcmp(mode, "contig-avoid-image");
     size_t xbe_len = 0;
     unsigned char *xbe;
     char d[160];
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !avoid && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -199,6 +201,8 @@ int main(int argc, char **argv)
         set_env("RECOMP_HEAP_RECLAIM", "1");
     if (ext)
         set_env("RECOMP_EXT_VMA", "1");
+    if (avoid)
+        set_env("RECOMP_CONTIG_AVOID_IMAGE", "1");
     if (ext128)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
 
@@ -225,6 +229,21 @@ int main(int argc, char **argv)
         }
     }
     printf("mode: %s\n", mode);
+
+    /* 0. A contiguous block and the loaded image share physical numbers
+     * unless RECOMP_CONTIG_AVOID_IMAGE keeps the block out of the image. */
+    if (!ext) {
+        uint32_t c = xbox_ContiguousAlloc(1024u * 1024u, 4096);
+        uint32_t phys = c - XBOX_CONTIG_BASE;
+        int overlaps = phys < g_xbox_image_hi && phys + 1024u * 1024u > g_xbox_image_lo;
+        snprintf(d, sizeof d, "block 0x%08X, image 0x%08X..0x%08X",
+                 c, g_xbox_image_lo, g_xbox_image_hi);
+        if (avoid)
+            check(c && !overlaps, "avoid-image: a 1 MB block lands outside the image", d);
+        else
+            check(c && overlaps, "a 1 MB block still fills from the bottom by default", d);
+        xbox_ContiguousFree(c);
+    }
 
     /* 1. A small request after a large free. */
     if (!ext) {

@@ -153,8 +153,8 @@ static const char s_hlsl[] =
 "  float4 t3 : TEXCOORD3; noperspective float fog : TEXCOORD4;\n"
 "  float clip : SV_ClipDistance0; };\n"
 "VSOut VS(VSIn v) {\n"
-"  VSOut o; float w = v.pos.w;\n"
-"  o.pos = float4((v.pos.x / vp.x * 2.0 - 1.0) * w, (1.0 - v.pos.y / vp.y * 2.0) * w,\n"
+"  VSOut o; float w = v.pos.w; float2 sp = v.pos.xy + PXO;\n"
+"  o.pos = float4((sp.x / vp.x * 2.0 - 1.0) * w, (1.0 - sp.y / vp.y * 2.0) * w,\n"
 "                 v.pos.z * vp.z * w, w);\n"
 "  o.d0 = v.d0; o.d1 = v.d1; o.t0 = v.t0; o.t1 = v.t1; o.t2 = v.t2; o.t3 = v.t3;\n"
 "  o.fog = v.fg.x;\n"
@@ -340,7 +340,16 @@ int gg_enabled(void)
 static ID3DBlob *compile(const char *entry, const char *target)
 {
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "genry_gpu", NULL, NULL,
+    /* GENRY_PX_OFS=<px>: a shift of the NV2A's screen coordinates before they
+     * go to D3D11's pixel grid (whose centres sit at .5) -- testing the
+     * one-pixel column and row along the frame's left and top edges. */
+    static char pxo[48];
+    D3D_SHADER_MACRO defs[2] = { { "PXO", pxo }, { NULL, NULL } };
+    if (!pxo[0]) {
+        const char *e = getenv("GENRY_PX_OFS");
+        snprintf(pxo, sizeof pxo, "float2(%s, %s)", e ? e : "0.0", e ? e : "0.0");
+    }
+    HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "genry_gpu", defs, NULL,
                             entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                             &code, &err);
     if (FAILED(hr)) {

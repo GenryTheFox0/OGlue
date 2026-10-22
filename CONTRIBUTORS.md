@@ -403,6 +403,9 @@ direction.
 - **Scoped the macOS port (#19)** — an accurate, specific list of what stands
   in the way (`MAP_FIXED_NOREPLACE`, `memfd_create`, `GlobalMemoryStatusEx`,
   SDL2/epoxy) rather than a request, which is the useful kind of issue.
+  And closed the loop on it: a fresh macOS install of v0.15.0 ran
+  Burnout 3 through boot, the EA, Criterion and RenderWare logos to its title
+  screen, with the keyboard working.
 
 - **The Xbox memory model on a POSIX host (#60)** — and five bugs found by
   making it actually run. The sentinel bug: `for (i = 0; try_bases[i] != 0 || i
@@ -823,6 +826,14 @@ fails on the old code and a real-CPU conformance case where one applies.
   snapshot, `cmp; pushfd` dropping OF, and gradual starvation that the audio
   reports missed.
 
+*v0.15.0*
+- **Portable controller mapping rules (#203):** named bindings and a text
+  format for them, remapping, radial deadzones, trigger thresholds and merge
+  rules, rebuilt on #191's key table as asked. `RECOMP_KEYBOARD` is the first
+  adopter, checked byte for byte against v0.14.0 over 224k states.
+- **The `g_eflags` gap in the interrupt snapshot**, from the #186/#192 test
+  notes, is fixed in v0.15.0.
+
 ### Leonardo Valdes Arteaga — [@eolandro](https://github.com/eolandro)
 - **The runtime did not build with GCC on Linux (#172)** — the VEH code
   needed real `EXCEPTION_POINTERS`/`CONTEXT` shapes and `EXCEPTION_SINGLE_STEP`,
@@ -864,6 +875,33 @@ split from one fork into topic PRs with an index (#184).
   questions every audio report starts with: did the device run dry, and which
   voice is it.
 
+*v0.15.0*
+- **Lifter accuracy and discovery past switch tables (#186):**
+  - `movsx r32, bp/sp` sign-extends.
+  - `pushfd`/`popfd` go through a `g_eflags` image, with OF and PF rebuilt;
+    `cmp; pushfd` had pushed OF clear.
+  - `cpuid` answers as the P3.
+  - x87 trig reduces with the hardware's 66-bit pi.
+  - `pop esp` leaves esp at the popped value.
+  - Offset frames own their frame.
+  - `RECOMP_STUB_LOG` names each unresolved stub the first time it runs.
+  - Functions after embedded switch tables are found.
+
+  It was rebased onto v0.14.0 and cut down to exactly what was still
+  missing.
+- **Interrupts, DPCs and pacing (#192):** a one-CPU DISPATCH gate, IRQs at
+  safe points, a 60 Hz vblank and flips held to it, all behind switches that
+  are off by default. The Burnout 3 2-flip hang turned out to be a stale
+  glue address, and was traced before the merge.
+- **`Partition1\CACHE` in the save dir (#206)** and **`xinput1_4` for
+  mingw builds (#221).**
+- **Reviews that changed other people's PRs:**
+  - the `XC_MAX_OS` DVD region offset in #216;
+  - the vsync-off busy loop in #215;
+  - the clip lerp NaN in #211;
+  - the CLEAR_RECT rule in #212 and #222, each tested on Burnout 3 and
+    BLiNX 2 before suggesting it.
+
 ### nworkers — [@nworkers](https://github.com/nworkers)
 Found on *Jet Set Radio Future*.
 
@@ -876,6 +914,14 @@ Found on *Jet Set Radio Future*.
 - **Branches out of alias bodies (#199)** — a vtable-only dispatcher branched
   past its own `ret` into a gap the disassembler never claimed, and each call came
   back 12 bytes short on the stack.
+- **Vtable methods that never reach a `ret` in their own gap (#236)** — 103 of
+  JSRF's methods were refused by the closed-body proof: guarded vcall tails,
+  dispatchers whose switch arms are other methods, and error paths that leave
+  by a `jmp` to a helper nobody had found. Three of them stopped the attract
+  demo. Each refusal was measured and sorted by shape before any code changed.
+  Along the way: MSVC's byte index table, parked after a dword jump table,
+  was read as one more arm, and v0.15.0 had accepted eight such data words as
+  function entries.
 
 ### LeandroSSB — [@LeandroSSB](https://github.com/LeandroSSB)
 Found while bringing up *Black* (Criterion, XDK 5849).
@@ -892,6 +938,57 @@ Found while bringing up *Black* (Criterion, XDK 5849).
 - **A mouse and keyboard pad (#205)**, opt-in with `RECOMP_MKB` on Windows:
   raw-input mouse movement becomes stick deflection, WASD and buttons merge on
   top of a real pad, and F9 toggles capture.
+
+### Koen Hendriks — [@koenhendriks](https://github.com/koenhendriks)
+Found while bringing up *SSX 3* (PAL); see
+[SSX3-recomp](https://github.com/koenhendriks/SSX3-recomp).
+
+- **The pushbuffer executor (#210, #211, #212):**
+  - attributes with no array read their current value;
+  - the fog-plane and eye-position constants;
+  - the colour clamp, and mirror and border addressing;
+  - clipping in clip space and at the near plane, instead of after the
+    title's viewport scale;
+  - render-to-texture into swizzled surfaces, for SSX 3's shadow maps;
+  - the CLEAR_RECT rule (the rect alone, as xemu does), which @apexJCL's fork
+    and #222 have since adopted.
+- **A scalable framebuffer window, fullscreen and a D3D11 presenter (#215).**
+- **The host time zone in the EEPROM settings (#216)**, so saves stop being
+  stamped UTC.
+- **Four root-hub ports (#214).** The first pad used to arrive as player 3;
+  it's now on controller port 1.
+- **Rumble from the XID output report (#213).**
+- **Entry stubs (#207)**, opt-in: an unresolved target inside a function
+  enters a copy of it.
+
+### Matt Graham — [@MattSG](https://github.com/MattSG)
+- **PVIDEO overlay scanout (#220).** Bink's Xbox player draws movies through
+  the NV2A overlay, so they never appeared. The overlay is now scanned out at
+  its scale and colour key, and STOP clears the pending banks D3D waits on.
+- **Voice processor fixes (#217):**
+  - ADPCM reads used to overrun the decode buffers;
+  - VOICE_LOCK locks one voice rather than a whole frame of mixing;
+  - volume changes ramp across the frame;
+  - HRTF.
+
+### Madiyar — [@kaskabayev](https://github.com/kaskabayev)
+- **XDK register constants cut `.text` functions (#234).** D3D's NV2A
+  constants equal `.text` addresses, and the immediate-reference pass took
+  them as function starts. On *NFSU1* that split a jump-table switch.
+  `--skip-library-immediates` stops it.
+- **NOTICE entries for the xemu-derived NV2A core, NV2A state and APU
+  headers (#233).**
+
+### bertibertig — [@bertibertig](https://github.com/bertibertig)
+Found on *SSX 3* (PAL) on Linux.
+
+- **The POSIX file backend ignored `RootDirectory` (#237).** XAPI's save code
+  opens the save directory, then each file in it by its bare name
+  (`Data.ssx`). The Win32 backend joined the name to the handle's path; the
+  POSIX one sent it through the path table alone, so overwriting a save
+  failed with `STATUS_OBJECT_PATH_NOT_FOUND` and the game said "Unable to
+  save". Came with a cross-platform test that fails 3 of 9 checks without
+  the fix.
 
 ---
 
@@ -953,6 +1050,18 @@ Found while bringing up *Black* (Criterion, XDK 5849).
   the guide people are actually pointed to, said "Windows 11" as a hard
   requirement and never mentioned either. Now carries a platform matrix that
   says what genuinely differs rather than implying one OS.
+
+### ranzo312-cyber — [@ranzo312-cyber](https://github.com/ranzo312-cyber)
+- **The *Darkwatch* bring-up report (#127).** It measured three runtime bugs
+  and attached a patch for each:
+  - guest callbacks that run inside a kernel call (APCs, inline DPCs,
+    `KeSynchronizeExecution`) wrote over the caller's registers;
+  - contiguous blocks were handed out inside the image's physical range, so
+    XPP's descriptors resolved to the image and the pad never enumerated;
+  - `lahf` emitted `_cf` undeclared.
+
+  All three are fixed in v0.15.0 (#235 and its follow-up). The report kept
+  its one unproven workaround clearly apart from the fixes.
 
 ---
 

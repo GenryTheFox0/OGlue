@@ -100,7 +100,7 @@ static void note(uint32_t subch, uint32_t method)
 
 /* NV097 (Kelvin 3D class) methods worth naming. The point of the survey is to
  * decide what a translator has to implement, and a bare method number does not
- * answer that -- "0x1808 x412" only means something once it reads
+ * answer that -- "0x1818 x412" only means something once it reads
  * INLINE_ARRAY. Unnamed ones still get counted. */
 static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x0000, "SET_OBJECT" },
@@ -131,8 +131,9 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x1760, "SET_VERTEX_DATA_ARRAY_FORMAT" },
     { 0x17FC, "SET_BEGIN_END" },
     { 0x1800, "ARRAY_ELEMENT16" },
-    { 0x1808, "INLINE_ARRAY" },
+    { 0x1808, "ARRAY_ELEMENT32" },
     { 0x1810, "DRAW_ARRAYS" },
+    { 0x1818, "INLINE_ARRAY" },
     { 0x1B00, "SET_TEXTURE_OFFSET" },
     { 0x1B04, "SET_TEXTURE_FORMAT" },
     { 0x1B08, "SET_TEXTURE_ADDRESS" },
@@ -460,6 +461,11 @@ int nv2a_pb_dma_walk(void)
  * wrap is handled by the caller, which scans the two pieces separately.
  * Addresses are physical, like PUT's, and reach guest memory through the
  * contiguous window. */
+/* Whether the walk is inside a pushbuffer CALL, for the executor: a flip
+ * hold is only armed at the top level (nv2a_pb_exec.c). */
+static int s_in_call;
+int nv2a_pb_scan_in_call(void) { return s_in_call; }
+
 static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                 uint32_t *jumps, uint32_t *unknown)
 {
@@ -490,7 +496,9 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             if (!in_call) {
                 uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
                 s_tot_calls++;
+                s_in_call = 1;
                 words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
+                s_in_call = 0;
             }
             continue;
         }
@@ -525,6 +533,10 @@ void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
+    if (s_exec_enabled) {
+        extern void nv2a_pb_exec_walk_begin(void);
+        nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
+    }
     words = pb_walk_segment(start_va, end_va, 0, &jumps, &unknown);
 
     s_tot_words += words;

@@ -199,7 +199,10 @@ def cases():
                                      "mov eax, 0", "jae done", "mov eax, 1",
                                      "done: mov ecx, eax"])
     add("seq_wait_sahf_jne", three + ["fcompp", "fwait", "fnstsw ax", "sahf"] + _jump("ne"))
-    add("seq_fptan_sahf_jp", two + ["fptan", "fwait", "fnstsw ax", "sahf"] + _jump("p"))
+    # fptan's st0 within fptan's own tolerance: an AMD host reduces with a
+    # more exact pi than the P3 (see conformance/cases.py, _trig).
+    add("seq_fptan_sahf_jp", two + ["fptan", "fwait", "fnstsw ax", "sahf"] + _jump("p"),
+        tol=1e-9)
 
     for cmp in ("fcomi", "fcomip", "fucomi", "fucomip"):
         pre = two + [f"{cmp} st, st(1)"]

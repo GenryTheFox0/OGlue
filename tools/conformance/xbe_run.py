@@ -17,8 +17,8 @@ are chosen mechanically rather than by hand:
     an argument we invented;
   * no `fs:` access (SEH), no string operations (they walk esi/edi as
     pointers), no privileged or I/O instructions;
-  * and nothing that lifts to a bare comment, since an unhandled instruction is
-    a silent no-op that the comparison cannot see.
+  * and nothing that lifts to a bare comment or a RECOMP_UNIMPL call, since an
+    unhandled instruction is a silent no-op that the comparison cannot see.
 
 Arguments are small integers. A function that treated one as a pointer would
 fault -- but the operand rule above already excludes those, and the native call
@@ -34,7 +34,10 @@ from . import image
 # we need a supply of verifiable functions, not all of them.
 _PROLOGUE = bytes((0x55, 0x8B, 0xEC))
 
-_LIFTED_RE = '\\blifted_([0-9A-Fa-f]{8})\\s*\\('
+# Any mention, not only a direct call: the lifter also passes a callee by
+# name, as in RECOMP_ABI_CALL(0x0009748Cu, lifted_0009748C), and a callee seen
+# only that way was never declared or stubbed, so the harness did not compile.
+_LIFTED_RE = '\\blifted_([0-9A-Fa-f]{8})\\b'
 
 _MAX_INSNS = 400
 _MIN_BYTES, _MAX_BYTES = 12, 1200
@@ -252,8 +255,12 @@ def lift(data, sections, candidates):
         tr = FunctionTranslator(data, func_db)
         for va, size, _ in candidates:
             body = tr.translate_function(va, func_db[va])
+            # Untranslated instructions used to lift to a bare comment; they
+            # now lift to a RECOMP_UNIMPL(...) call, which the harness does
+            # not define. Either way the instruction is a no-op.
             gaps = [l.strip() for l in body.splitlines()
-                    if l.strip().startswith(("/* TODO", "/* FPU:"))]
+                    if l.strip().startswith(("/* TODO", "/* FPU:"))
+                    or "RECOMP_UNIMPL(" in l]
             if gaps:
                 # An unhandled instruction is a silent no-op: the comparison
                 # would be meaningless, so say which one and move on.
@@ -644,9 +651,13 @@ int main(int argc, char **argv) {
     }
     if (!map_image(path)) return 2;
     /* Deterministic, and not all zero: a function that reads it should see
-       something a bug could get wrong. */
+       something a bug could get wrong. A zero word every 64 bytes, though:
+       i * 7 + 1 never has two zero bytes in a row, so a wide-string routine
+       (FBoS's wcscpy at 0x000728F0) found no terminator, ran off the end of
+       the scratch buffer into the harness's own buffers, and reported a
+       mismatch that was the harness, not the lifter. */
     for (i = 0; i < SCRATCH_SIZE; i++)
-        g_scratch_seed[i] = (unsigned char)(i * 7 + 1);
+        g_scratch_seed[i] = (i % 64) >= 62 ? 0 : (unsigned char)(i * 7 + 1);
     { unsigned short cw = 0x027F; __asm { fldcw cw } }
     for (i = 0; i < (int)(sizeof g_funcs / sizeof g_funcs[0]); i++) {
         shown = 0;

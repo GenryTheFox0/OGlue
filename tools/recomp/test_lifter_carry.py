@@ -256,6 +256,15 @@ class NeedsCarryTest(unittest.TestCase):
         self.assertFalse(FunctionTranslator._function_needs_cf(
             [self._insn("add"), self._insn("jge")]))
 
+    def test_lahf_after_add_needs_cf(self):
+        # lahf's AH carries CF via a jb probe of the add, which reads _cf.
+        self.assertTrue(FunctionTranslator._function_needs_cf(
+            [self._insn("add"), self._insn("lahf")]))
+
+    def test_lahf_after_cmp_does_not(self):
+        self.assertFalse(FunctionTranslator._function_needs_cf(
+            [self._insn("add"), self._insn("cmp"), self._insn("lahf")]))
+
     def test_adc_alone_needs_cf(self):
         self.assertTrue(FunctionTranslator._function_needs_cf(
             [self._insn("adc")]))

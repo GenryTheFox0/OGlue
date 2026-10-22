@@ -86,6 +86,15 @@ def main():
              "into each other.",
     )
 
+    parser.add_argument(
+        "--skip-library-immediates",
+        action="store_true",
+        help="An immediate in a library section (D3D, DSOUND, XPP, ...) never "
+             "starts a function in .text. For titles whose XDK code holds "
+             "register constants equal to .text addresses (NFSU1). Off by "
+             "default.",
+    )
+
     args = parser.parse_args()
 
     try:
@@ -113,6 +122,7 @@ def main():
             extra_sections=extra,
             seed_functions=seed_funcs,
             observed_seeds=observed,
+            skip_library_immediates=args.skip_library_immediates,
         )
         success = disassembler.run()
         sys.exit(0 if success else 1)

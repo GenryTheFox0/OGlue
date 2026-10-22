@@ -78,7 +78,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.14.0 — _"Other Machines"_ (October 2026).**
+**Current version: v0.16.0 — _"Small Print"_ (October 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -304,6 +304,15 @@ cmake --build build --config Release
 build\Release\your_game_recomp.exe          # named after project() in your CMakeLists
 ```
 
+### An optional front end
+
+[xboxrecomp-cli](https://github.com/apexJCL/xboxrecomp-cli) (`xbr`, by
+[@apexJCL](https://github.com/apexJCL)) wraps this pipeline for game repos.
+A game repo describes itself in one `game.toml`, and the CLI provides pinned
+toolchains, cross-builds, packaging and a player build wizard. It is
+maintained outside this repo and tracks its tags. `regen.sh` and the steps
+above stay the documented route (#223).
+
 ### What To Expect
 
 The first time you run a recompiled game, **it will crash**. That's normal. The process is iterative:
@@ -489,7 +498,7 @@ definitions — they are the real proof for the shift, flag and x87 work, and
 each is paired with a negative control that feeds the harness the pre-fix
 expression and requires it to fail. They need a C compiler on `PATH`, and
 **skip rather than fail without one**, so check the skip count: a clean run is
-812 passed / 0 skipped. If clang is installed but not on `PATH`:
+936 passed / 0 skipped. If clang is installed but not on `PATH`:
 
 ```bash
 export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
@@ -607,6 +616,287 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.16.0 — *"Small Print"* (October 2026)
+
+*Four PRs, every one about a few bytes the tools read past or read too wide.
+A `push cx` moved the stack by four bytes where the CPU moves it by two. An
+MSVC byte index table, `00 02 02 00`, was read as one more dword arm of the
+switch in front of it. Functions behind `nop` padding went unnoticed because
+only `int3` counted as padding. And a save file opened by its bare name,
+`Data.ssx`, lost the directory handle that said where it lived. Each was
+small, and each stopped a game: Jet Set Radio Future's attract demo, SSX 3's
+saves on Linux, and Panzer Dragoon Orta's first boot.*
+
+**Contributed: disassembler**
+
+- **Vtable methods that never reach a `ret` inside their own gap are found.**
+  The closed-body proof refused 103 of JSRF's methods. They were guarded vcall
+  tails (`test eax, eax ; je done ; … ; jmp [eax+N]`), dispatchers whose
+  switch arms are other methods, and error paths that leave by a direct `jmp`
+  to a helper nobody had found yet. A body may now close through an indirect
+  tail via memory, through a proven entry, or through a direct branch whose
+  destination is proven the same way in its own gap, eight levels deep. A
+  byte index table is never taken as an entry: v0.15.0 had accepted eight
+  such data words as functions. A measured jump table also stops in front of
+  the byte table packed after it. On JSRF, 111 of the 113 methods are now
+  entries, up from 10, and the attract demo's three are all found —
+  *[@nworkers](https://github.com/nworkers)* (#236)
+
+**Contributed: kernel**
+
+- **The POSIX file backend opens names relative to a `RootDirectory`
+  handle**, as the Win32 backend already did. XAPI's save code opens the save
+  directory, then each file in it by its bare name. On Linux, overwriting an
+  SSX 3 save failed with "Unable to save" (`STATUS_OBJECT_PATH_NOT_FOUND`).
+  `NtCreateFile`, `NtOpenFile`, `NtDeleteFile` and
+  `NtQueryFullAttributesFile` all take the join. A new cross-platform test,
+  `tests/kernel_file_relative`, covers it —
+  *[@bertibertig](https://github.com/bertibertig)* (#237)
+
+**Maintainer: found by Panzer Dragoon Orta**
+
+- **16-bit `push` and `pop` move esp by 2.** `pop cx` emitted `POP32(esp,
+  cx)`, which did not compile. `push cx` compiled but pushed four bytes,
+  leaving the stack two bytes off. A pop to memory now writes after the
+  increment, as x86 does —
+  *[@sp00nznet](https://github.com/sp00nznet)* (#238)
+- **Functions past `nop` padding are gap functions.** `_pass_cc_boundaries`
+  only knew `int3` padding, so Orta's COM forwarders, reached only through
+  vtables, went unfound, and the first one called at boot was an unresolved
+  indirect call. The gap pass now sweeps the addresses past padding first,
+  then the ones straight after a `ret`. Doing both in one sweep split a
+  forwarder's own error return off as a function. On Orta: 17,764 → 17,933
+  functions, unresolved call stubs 71 → 41, and it boots to the SEGA and
+  Smilebit logos —
+  *[@sp00nznet](https://github.com/sp00nznet)* (#239)
+
+**Testing**
+
+- [@dplewis](https://github.com/dplewis) ran a fresh macOS install of
+  v0.15.0: Burnout 3 boots through the EA, Criterion and RenderWare logos to
+  its title screen, with the keyboard working (#19).
+- `tests/kernel_file_relative` and `tests/kernel_file_status` build and pass
+  under MSVC x64 and on Linux (WSL, GCC 14).
+- **Half-Life 2, regenerated and rebuilt on this release.** It finds 51,114
+  functions (51,104 before), lifts every one, reaches its title screen, and
+  runs 90 s with no faults and no unresolved indirect calls. MSVC pads with
+  `int3`, so #239 finds little there, as expected.
+- A clean run is now **936 passed / 0 skipped**, up from 916, plus 6,368
+  conformance vectors with no mismatches on an AMD host.
+
+**Known issue**
+
+- Burnout 3 (sp00nznet/burnout3) built against `main` stops before its first
+  draw. The break is somewhere in `afeb69f..fb09636`, before v0.15.0, and is
+  being bisected; `burnout3` pins `afeb69f` until then (#240).
+
+### v0.15.0 — *"Second Reading"* (October 2026)
+
+*Twenty-four PRs from six people, plus one bug report. Much of what is fixed
+here was caught because contributors read and ran each other's work before it
+merged. [@apexJCL](https://github.com/apexJCL) tested
+[@koenhendriks](https://github.com/koenhendriks)'s SSX 3 PRs on Burnout 3 and
+BLiNX 2 and found three things. A DVD region had landed in MiscFlags. With
+vsync off the present spun a core at 8,500 loops a second. A clipped vertex
+could come out with w ≤ 0. [@vyanhursky](https://github.com/vyanhursky)'s
+Def Jam test notes found an interrupt snapshot that dropped* `g_eflags`*. A
+Darkwatch bring-up sent a measured report, a patch and a watchdog dump. Even
+the test oracle needed checking: the new x87 trig model matches the Xbox's
+Pentium III, and an AMD test machine disagreed with it, correctly. Everything
+below was looked at twice.*
+
+**Contributed: lifter, recompiler and disassembler**
+
+- **Lifter accuracy and discovery past switch tables.** The changes:
+  - `movsx r32, bp/sp` used to zero-extend; it now sign-extends.
+  - `pushfd`/`popfd` go through a `g_eflags` image, with OF and PF rebuilt
+    from `cmp`, `sub`, `add` and the logic ops. `cmp al, bl; pushfd` with
+    -128 - 1 had pushed OF clear.
+  - `cpuid` answers as the P3.
+  - x87 trig reduces with the 66-bit pi the hardware uses.
+  - `pop esp` leaves esp at the popped value.
+  - MSVC offset frames own their frame.
+  - `RECOMP_STUB_LOG=1` names each unresolved stub the first time it runs.
+  - Code sections are decoded to their virtual end.
+  - Functions after an embedded switch table are found.
+
+  *[@apexJCL](https://github.com/apexJCL)* (#186)
+- **An unresolved target inside a function enters that function.**
+  `--entry-stubs` re-emits the containing function from the target instead of
+  returning at once. It's opt-in, because each target gets a full copy.
+  Shared epilogues get a stub that pops their registers —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#207)
+- **XDK register constants no longer cut `.text` functions.** With
+  `--skip-library-immediates`, an immediate in a library section (D3D's NV2A
+  constants, which can equal `.text` addresses) never starts a function.
+  Found on NFSU1, where it split a switch —
+  *[@kaskabayev](https://github.com/kaskabayev)* (#234)
+
+**Contributed: kernel, interrupts and timing**
+
+- **Interrupts, DPCs and pacing**, every part behind a switch that is off by
+  default:
+  - `RECOMP_DISPATCH_GATE=1`: a one-CPU DISPATCH gate, with DPCs at the raise
+    and interrupts at safe points.
+  - `RECOMP_VBLANK=paced`: a 60 Hz vblank schedule with an ack thread.
+  - `RECOMP_FLIP_PACING=1`: flips held to the guest's vblank.
+  - `RECOMP_GUEST_CPUS=<n>`: guest threads pinned to fewer cores.
+  - The lifter's `--back-edge-yield`: loop checks for the guest CPU
+    scheduler.
+
+  `RECOMP_GUEST_LOCK=1` used to be a plain critical section and is now the
+  quantum/hand-off scheduler. With nothing set, the runtime and the generated
+  code behave as in v0.14.0 —
+  *[@apexJCL](https://github.com/apexJCL)* (#192)
+- **The host time zone reaches the title.** `XC_MAX_OS` and the single
+  time-zone queries return the host's bias, names and daylight dates instead
+  of zeroes, so saves stop being stamped UTC —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#216)
+- **`Partition1\CACHE` goes to `<save_dir>/TitleCache`.** It used to go into
+  the game directory: every run wrote into the extracted game files, and all
+  save directories shared one cache —
+  *[@apexJCL](https://github.com/apexJCL)* (#206)
+
+**Contributed: graphics, video and audio**
+
+- **Pushbuffer executor:**
+  - Attributes with no array read their current value. SSX 3's front end had
+    collapsed onto the viewport offset.
+  - `SET_FOG_PLANE` and `SET_EYE_POSITION` reach c[57] and c[56].
+  - The oD0/oD1 colour outputs are clamped.
+  - Mirror and border addressing are implemented.
+
+  *[@koenhendriks](https://github.com/koenhendriks)* (#210)
+- **Clipping happens in clip space, and at the near plane.** It used to
+  happen after the viewport scale, which is a constant the title owns —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#211)
+- **Render to texture and `CLEAR_RECT`.** Swizzled colour surfaces are
+  written in Morton order, so SSX 3's shadow maps sample correctly. A clear
+  covers the clear rect alone, as xemu does —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#212)
+- **A scalable Windows window, fullscreen, and an opt-in D3D11 presenter**
+  (`RECOMP_D3D_PRESENT=1`, `RECOMP_PRESENT_VSYNC`). Closing the window exits
+  through the exit hook —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#215)
+- **PVIDEO overlay scanout.** Bink's Xbox player draws through the NV2A
+  overlay, so movies never appeared. The YUY2 overlay is now drawn over the
+  framebuffer at its scale and colour key, and STOP clears the pending banks
+  the title waits on —
+  *[@MattSG](https://github.com/MattSG)* (#220)
+- **Voice processor fixes:**
+  - ADPCM reads used to overrun the decode buffers; they now stay inside
+    them.
+  - VOICE_LOCK locks one voice, instead of waiting for a whole frame of
+    mixing.
+  - Volume changes ramp across a frame.
+  - HRTF is on, as in xemu; `RECOMP_APU_HRTF=0` turns it off.
+
+  *[@MattSG](https://github.com/MattSG)* (#217)
+
+**Contributed: input and platform**
+
+- **Portable controller mapping rules:**
+  - named bindings and a text format for them;
+  - remapping;
+  - radial deadzones and trigger thresholds;
+  - merge rules.
+
+  They're built on #191's key table, and `RECOMP_KEYBOARD` is the first
+  adopter, byte for byte the same as v0.14.0 —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#203)
+- **Four root-hub ports, and the first pad on controller port 1.** The pad
+  used to arrive as player 3, so a title that reads only slot 0 saw no
+  controller. `RECOMP_USB_PORT=0` / `RECOMP_USB_NDP=2` bring back the old
+  layout —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#214)
+- **Rumble.** The XID output report is forwarded to the host pad;
+  `RECOMP_RUMBLE=0` turns it off —
+  *[@koenhendriks](https://github.com/koenhendriks)* (#213)
+- **mingw-built exes start on stock Windows.** They link `xinput1_4` instead
+  of the redistributable's `xinput1_3` —
+  *[@apexJCL](https://github.com/apexJCL)* (#221)
+- **NOTICE lists the xemu-derived NV2A core, NV2A state and APU API
+  headers** — *[@kaskabayev](https://github.com/kaskabayev)* (#233)
+
+**From the Darkwatch report**
+(*[@ranzo312-cyber](https://github.com/ranzo312-cyber)*, #127)
+
+- **In-thread guest callbacks give the caller its registers back.** APCs,
+  inline DPCs, `NtUserIoApcDispatcher` and `KeSynchronizeExecution` run guest
+  code inside the kernel call. The loader resumed with an APC's RDTSC value
+  in esi and faulted.
+- **`RECOMP_CONTIG_AVOID_IMAGE=1` keeps contiguous blocks out of the image's
+  pages.** In this runtime one physical number can name both the window and
+  the image, and the pad never enumerated because XPP's descriptors resolved
+  to the wrong one. It's opt-in, because it moves every block (#235).
+- **`lahf` after `add` emitted `_cf` undeclared.** #186 had the same fix;
+  the report's tests are kept.
+
+**Found by rebuilding real titles (maintainer)**
+
+- **Three v0.14.0 regressions, found by rebuilding Half-Life 2**, which no
+  test had caught:
+  - `lock xadd` didn't compile.
+  - Code after int3 padding had to probe as code, so `mov eax, N; call
+    __chkstk` frames vanished and the game segfaulted at boot.
+  - This-adjusting vcall thunks vanished.
+
+  HL2 now reaches its title screen (#224).
+- **Fallout: Brotherhood of Steel:**
+  - File I/O APCs left esp 12 bytes high, and can now be deferred to the next
+    alertable wait (#226).
+  - Code-section gaps are scanned for function-pointer tables, skipping
+    switch tables; D3D's render-state handlers had no body (#227).
+  - A batch's triangles rasterise together on the worker pool. The first
+    level went from 5.5 fps, with the workers idle (#228).
+  - The per-kick `DMA_PUT` line only prints under `RECOMP_NV2A_TRACE` (#230).
+  - `conformance --xbe` builds on titles with untranslated instructions
+    (#229).
+
+**Follow-ups made while merging**
+
+- **Conformance and fpdiff on AMD hosts.** Both use the host CPU as the
+  oracle, and only Intel's x87 reduces like the P3. On AMD the trig rows
+  with pi/4 < |x| < 2^63 are dropped; `tests/x87_trig` checks them against
+  the model everywhere.
+- **`g_eflags` in the IRQ snapshot**, the point #186 and #192 met at.
+  `guest_cpu` and `vblank_ack` raise the timer resolution, because at
+  Windows' default 15.6 ms tick they failed natively.
+- **`XC_MAX_OS`'s layout.** It's 0x60 bytes, DVD region at 0x5C, and a short
+  buffer gets `STATUS_BUFFER_TOO_SMALL`.
+- **Present pacing.** It's paced only when vsync is on.
+- **A clipped vertex sits exactly on its plane.**
+- **`CLEAR_RECT`** needs both halves, and swizzled writes stay inside
+  `1<<log`.
+- **ADPCM buffers** hold every block count the 5-bit field can name, so a
+  stream voice is never refused and left hanging.
+- **The input layer:** both Shifts are released on `VK_SHIFT`.
+- **`xbox_video` links `xbox_nv2a`.** #220's overlay scanout calls into
+  `nv2a_mmio_hook.c`, and a game that links the libraries one by one (HL2)
+  failed to link. The Half-Life 2 rebuild caught it.
+
+**Held** for the next round, with reviews posted:
+- #222, Black bring-up 2. Its shadow and critical-section caches tear.
+- #231, the pipelined rasteriser. It needs a rebase over the NV2A PRs above.
+- #197, the flags carried across calls. It is still waiting on its
+  size-cost rework.
+- #209, timing. It is ready to rebase now that #192 is in.
+
+**Testing**
+
+- Every `tests/*` project builds and passes under MSVC except the POSIX-only
+  ones and `d3d8_smoke`, as before, and #221's `input_xinput_imports`, which
+  needs mingw.
+- On Linux (WSL, GCC 14) the runtime builds, and every `tests/*` project that
+  targets POSIX builds and passes. The five Win32-only tests still don't build
+  there, as before, and the new `kernel_io_apc` is Windows-only and says so at
+  configure.
+- **Half-Life 2, regenerated and rebuilt on this release.** It found 51,104
+  functions (48,884 before), reaches its title screen as v0.14.0 with #224
+  did, and runs 90 s with no faults and no unresolved indirect calls.
+- A clean run is now **916 passed / 0 skipped**, up from 812, plus 6,368
+  conformance vectors with no mismatches on an AMD host, up from 6,351.
 
 ### v0.14.0 — *"Other Machines"* (October 2026)
 

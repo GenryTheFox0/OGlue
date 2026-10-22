@@ -2081,9 +2081,53 @@ static void bridge_KeWaitForSingleObject(void)
     if (!h)
         h = XBOX_TO_NATIVE(object);
 
+    /* GENRY 2026-10-22 (Шрам): D3D's busy-block wait. Its fence wait patches
+     * software method 5 into the pushbuffer and sleeps here until the GPU's
+     * interrupt for it; the executor stands in for that interrupt
+     * (xbox_Nv2aSoftwareWake), but runs on its own thread, and a patch that
+     * lands behind it is never executed -- Sonic Heroes then hung on NOW
+     * LOADING with 0 FPS. So the wait looks every 2 ms whether the executor
+     * has run all the title has submitted: then every fence it can be waiting
+     * for is behind the GPU, which is when the interrupt would have come. */
+    if (!timeout_ptr && object == xbox_Nv2aBusyEventVa()) {
+        LARGE_INTEGER slice;
+        slice.QuadPart = -20000;                    /* 2 ms */
+        for (;;) {
+            g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+                h, wait_reason, wait_mode, (BOOLEAN)alertable, &slice);
+            if (g_eax != 0x102u)                    /* not STATUS_TIMEOUT */
+                return;
+            if (xbox_Nv2aExecutorCaughtUp()) {
+                static volatile LONG woken;
+                if (InterlockedIncrement(&woken) <= 4)
+                    fprintf(stderr, "  [NV2A] busy-block wait ended: the executor has run "
+                                    "everything submitted\n");
+                g_eax = 0;
+                return;
+            }
+        }
+    }
+
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+}
+
+/* What the GPU's interrupt for D3D's software method 5 does on the console:
+ * D3D's handler sets the busy-block event its fence wait sleeps on. Called by
+ * the executor when it reaches that method. */
+void xbox_Nv2aSoftwareWake(void)
+{
+    uint32_t ev = xbox_Nv2aBusyEventVa();
+    HANDLE h;
+
+    if (!ev)
+        return;
+    h = ke_shadow_lookup(ev);
+    if (!h)
+        h = bridge_resolve_handle(ev);
+    if (h)
+        SetEvent(h);
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */

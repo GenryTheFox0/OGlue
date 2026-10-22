@@ -1017,6 +1017,34 @@ static struct {
 } g_fence_mirrors[XBOX_MAX_FENCE_MIRRORS];
 static int g_fence_mirror_count = 0;
 
+/* GENRY 2026-10-22 (Шрам): DMA_PUT as of the executor's last pass -- every
+ * command before it has been executed (written by the ack thread). */
+static volatile LONG g_nv2a_done_put = -1;
+static int fence_readable(uint32_t va, uint32_t bytes);
+
+/* D3D's busy-block event: the device's KEVENT at +0x1DCC (XDK 5849, Sonic
+ * Heroes and Shadow alike), the one its fence wait sleeps on after patching
+ * software method 5 ("wake me") into the pushbuffer; 0 when no device is
+ * registered (xbox_Nv2aMirrorFence) or built yet. */
+uint32_t xbox_Nv2aBusyEventVa(void)
+{
+    uint32_t dev;
+    if (!g_fence_mirror_count || !fence_readable(g_fence_mirrors[0].device_ptr_va, 4))
+        return 0;
+    dev = *(volatile uint32_t *)((char *)g_memory_base + g_fence_mirrors[0].device_ptr_va);
+    return dev && fence_readable(dev + 0x1DCC, 16) ? dev + 0x1DCC : 0;
+}
+
+/* Whether the executor has run everything the title has submitted: nothing
+ * past the last PUT it took, and PUT has not moved since. A fence D3D waits
+ * for then lies behind the GPU, wherever D3D patched its wake-up. */
+int xbox_Nv2aExecutorCaughtUp(void)
+{
+    LONG done = InterlockedCompareExchange(&g_nv2a_done_put, 0, 0);
+    volatile uint32_t *put = xbox_Nv2aRegPtr(0x800040u);   /* USER_DMA_PUT */
+    return done != -1 && put && (uint32_t)done == *put;
+}
+
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off)
 {
@@ -1673,6 +1701,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     get_written = put;
                 }
                 last_put = put; last_put_ms = now_ms;
+                InterlockedExchange(&g_nv2a_done_put, (LONG)put);
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET
                  * tells those apart -- D3D waits for GET to reach PUT before it

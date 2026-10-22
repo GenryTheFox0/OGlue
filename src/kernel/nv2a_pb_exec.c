@@ -4718,6 +4718,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.idx[s_gpu.idx_count++] = param;
         break;
     case NV097_NO_OPERATION:
+        /* GENRY 2026-10-22 (Шрам): software method 5 is D3D's "wake me" -- its
+         * fence wait sleeps until the interrupt for it (kernel_bridge.c,
+         * xbox_Nv2aSoftwareWake). */
+        if ((param & 0x1Fu) == 5u) {
+            extern void xbox_Nv2aSoftwareWake(void);
+            xbox_Nv2aSoftwareWake();
+        }
         /* Non-zero, it is one of D3D's software methods, which the GPU traps
          * to D3D's interrupt handler on the console. Only the swap's interval
          * matters here (nv2a_flip_hold.h); the rest stays a no-op. */

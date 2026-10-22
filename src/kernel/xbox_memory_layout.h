@@ -223,6 +223,13 @@ uint32_t xbox_ContiguousInUseBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* GENRY: D3D's busy-block event in the registered device (0 if none yet), and
+ * whether the executor has run everything submitted (kernel_bridge.c's
+ * KeWaitForSingleObject and the executor's software method 5). */
+uint32_t xbox_Nv2aBusyEventVa(void);
+int xbox_Nv2aExecutorCaughtUp(void);
+void xbox_Nv2aSoftwareWake(void);
+
 /* Where the mirrored fence word is (0 if none is registered or it does not
  * resolve into the contiguous window). For the pushbuffer executor. */
 uint32_t xbox_Nv2aFenceWordVa(void);

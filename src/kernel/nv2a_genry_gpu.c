@@ -340,14 +340,17 @@ int gg_enabled(void)
 static ID3DBlob *compile(const char *entry, const char *target)
 {
     ID3DBlob *code = NULL, *err = NULL;
-    /* GENRY_PX_OFS=<px>: a shift of the NV2A's screen coordinates before they
-     * go to D3D11's pixel grid (whose centres sit at .5) -- testing the
-     * one-pixel column and row along the frame's left and top edges. */
+    /* The NV2A's screen coordinates put a pixel's centre on the integer, as
+     * D3D8 does; D3D11's pixel grid puts it at .5. Unshifted, everything
+     * landed half a pixel right and down: column 0 and row 0 of every frame
+     * were never covered -- the dark strip with stray dots down the left edge
+     * of Shadow the Hedgehog. -0.5 is the D3D9-to-D3D10 rule;
+     * GENRY_PX_OFS=<px> sets another (0 = as before). */
     static char pxo[48];
     D3D_SHADER_MACRO defs[2] = { { "PXO", pxo }, { NULL, NULL } };
     if (!pxo[0]) {
         const char *e = getenv("GENRY_PX_OFS");
-        snprintf(pxo, sizeof pxo, "float2(%s, %s)", e ? e : "0.0", e ? e : "0.0");
+        snprintf(pxo, sizeof pxo, "float2(%s, %s)", e ? e : "-0.5", e ? e : "-0.5");
     }
     HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "genry_gpu", defs, NULL,
                             entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,

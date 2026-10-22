@@ -556,6 +556,10 @@ HANDLE xbox_GetMappingHandle(void);
 /* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
  * stack top, or 0 when the pool is exhausted. */
 uint32_t xbox_AllocThreadStack(void);
+/* The same for a thread that asked for `want` bytes of stack (its
+ * KernelStackSize): twice that, kept between 64 KB and 512 KB, smaller when
+ * the heap has no room for that much. */
+uint32_t xbox_AllocThreadStackSized(uint32_t want);
 
 /* A TIB and TLS block for a newly spawned guest thread, copied from the
  * template the loader built. Returns the new TIB's Xbox VA, or 0. */

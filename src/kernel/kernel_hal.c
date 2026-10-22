@@ -375,8 +375,14 @@ static void irq_config(void)
 {
     const char *v;
 
+    /* GENRY 2026-10-22 (Шрам): on by default in OGlue (RECOMP_DISPATCH_GATE=0
+     * turns it off). It is what 1.0's DISPATCH lock was to Sonic Heroes: a
+     * sound DPC run beside the thread that holds DirectSound at DISPATCH read
+     * a stale "voice done" and freed the song's voice -- with it off, the
+     * stage music died a minute and a half in (a 5-minute capture: level
+     * loudness 180 off, 1400-1900 on). */
     v = getenv("RECOMP_DISPATCH_GATE");
-    s_gate_on = (v && *v) ? atoi(v) != 0 : 0;
+    s_gate_on = (v && *v) ? atoi(v) != 0 : 1;
     v = getenv("RECOMP_IRQ_SAFE_POINTS");
     s_irq_mode = s_gate_on && ((v && *v) ? atoi(v) != 0 : 1);
     v = getenv("RECOMP_IRQ_SAFE_FORCE");

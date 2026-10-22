@@ -3982,10 +3982,20 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
  */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
-#define XBOX_THREAD_STACK_SIZE  (512 * 1024)
-#define XBOX_MAX_THREAD_STACKS  8
+/* GENRY 2026-10-22 (Шрам): a thread's stack is the size the title asked for
+ * (KernelStackSize -- an Xbox thread has that one stack), doubled for margin
+ * and kept between 64 KB and 512 KB, instead of 512 KB for everyone; and the
+ * pool holds 32. Shadow the Hedgehog spawns a loader thread for every load,
+ * from a heap that is nearly full by then: a 512 KB slice could not be found,
+ * the thread ran inline on the main thread, and the main thread waited on it
+ * forever behind the "Loading" card. */
+#define XBOX_THREAD_STACK_SIZE  (512 * 1024)        /* the most a thread gets */
+#define XBOX_THREAD_STACK_MIN   (64 * 1024)
+#define XBOX_MAX_THREAD_STACKS  32
 
 static int g_thread_stacks_used = 0;
+static struct { uint32_t top, base; } g_thread_stacks[XBOX_MAX_THREAD_STACKS];
+static SRWLOCK g_thread_stack_lock = SRWLOCK_INIT;
 
 /* A TIB and TLS block for a newly spawned guest thread.
  *
@@ -4037,11 +4047,20 @@ uint32_t xbox_AllocThreadTib(void)
 
 uint32_t xbox_AllocThreadStack(void)
 {
-    uint32_t base;
+    return xbox_AllocThreadStackSized(XBOX_THREAD_STACK_SIZE);
+}
 
-    if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
-        return 0;
-    }
+uint32_t xbox_AllocThreadStackSized(uint32_t want)
+{
+    uint32_t base = 0, size;
+    int i;
+
+    /* What the title asked for, twice over, within [MIN, MAX]; a heap too full
+     * for that gets a smaller one rather than none. */
+    size = want > XBOX_THREAD_STACK_SIZE / 2 ? XBOX_THREAD_STACK_SIZE : want * 2;
+    if (size < XBOX_THREAD_STACK_MIN)
+        size = XBOX_THREAD_STACK_MIN;
+    size = (size + 4095) & ~4095u;
 
     /* From the heap, not from XBOX_STACK_BASE.
      *
@@ -4057,13 +4076,27 @@ uint32_t xbox_AllocThreadStack(void)
      * taking slices from it is correct for any image size instead of only
      * for small ones.
      */
-    base = xbox_HeapAlloc(XBOX_THREAD_STACK_SIZE, 4096);
-    if (!base)
+    AcquireSRWLockExclusive(&g_thread_stack_lock);
+    for (i = 0; i < XBOX_MAX_THREAD_STACKS && g_thread_stacks[i].top; i++)
+        ;
+    if (i < XBOX_MAX_THREAD_STACKS) {
+        for (; size >= XBOX_THREAD_STACK_MIN && !base; size /= 2)
+            base = xbox_HeapAlloc(size, 4096);
+        if (base) {
+            size *= 2;  /* the loop halved once more after the hit */
+            /* Top of the slice, 16-byte aligned, growing down. */
+            g_thread_stacks[i].top = base + size - 16;
+            g_thread_stacks[i].base = base;
+            g_thread_stacks_used++;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_thread_stack_lock);
+    if (!base) {
+        fprintf(stderr, "[KERNEL] no thread stack: %d in use, heap has no %u KB\n",
+                g_thread_stacks_used, XBOX_THREAD_STACK_MIN / 1024);
         return 0;
-    g_thread_stacks_used++;
-
-    /* Top of the slice, 16-byte aligned, growing down. */
-    return base + XBOX_THREAD_STACK_SIZE - 16;
+    }
+    return g_thread_stacks[i].top;
 }
 
 /* Give a worker's stack back when the worker ends.
@@ -4082,11 +4115,24 @@ uint32_t xbox_AllocThreadStack(void)
  */
 void xbox_FreeThreadStack(uint32_t stack_top)
 {
+    uint32_t base = 0;
+    int i;
+
     if (!stack_top)
         return;
-    xbox_HeapFree(stack_top + 16 - XBOX_THREAD_STACK_SIZE);
-    if (g_thread_stacks_used > 0)
-        g_thread_stacks_used--;
+    AcquireSRWLockExclusive(&g_thread_stack_lock);
+    for (i = 0; i < XBOX_MAX_THREAD_STACKS; i++) {
+        if (g_thread_stacks[i].top == stack_top) {
+            base = g_thread_stacks[i].base;
+            g_thread_stacks[i].top = g_thread_stacks[i].base = 0;
+            if (g_thread_stacks_used > 0)
+                g_thread_stacks_used--;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_thread_stack_lock);
+    if (base)
+        xbox_HeapFree(base);
 }
 
 /* Page allocator over the contiguous window mapped at XBOX_CONTIG_BASE.

@@ -940,7 +940,15 @@ static void bridge_PsCreateSystemThreadEx(void)
                     return;
                 }
 
-                stack_top = xbox_AllocThreadStack();
+                stack_top = xbox_AllocThreadStackSized(STACK_ARG(2) + tls_size);
+                /* GENRY 2026-10-22 (Шрам): running the worker inline is a
+                 * deadlock whenever the caller then waits for it (Shadow's
+                 * loader), so first wait a while for a thread to end and give
+                 * its stack back. */
+                for (int waited = 0; !stack_top && waited < 5000; waited += 10) {
+                    Sleep(10);
+                    stack_top = xbox_AllocThreadStackSized(STACK_ARG(2) + tls_size);
+                }
 
                 if (!stack_top) {
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "

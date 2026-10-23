@@ -287,9 +287,18 @@ static int apu_call_isr(void)
  * not holding it here (apu_deliver_irq drops it before posting). If the line
  * dropped since the post, the routine reads ISTS and declines, as on
  * hardware. */
+/* GENRY 2026-10-22 (Шрам): and the DPC the routine queued, right after it,
+ * before anyone else gets the processor -- as 1.0 did (xbox_DrainDpcsInline
+ * under its DISPATCH lock). Left to the next raise or the timer thread,
+ * DirectSound's idle-voice DPC came late, and Sonic Heroes froze its world
+ * at a team-voice spot in Seaside Hill (00:32) until pausing kicked the
+ * sound along. */
+extern int xbox_DpcDrainHere(void);
+
 static void apu_isr_on_holder(void)
 {
     apu_call_isr();
+    xbox_DpcDrainHere();
 }
 
 static void apu_deliver_irq(MCPXAPUState *d)
@@ -360,6 +369,8 @@ static void apu_deliver_irq(MCPXAPUState *d)
         g_esp = XBOX_WORKER_STACK_TOP(slot);
         g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
         apu_call_isr();
+        if (how == XBOX_IRQ_GATED)
+            xbox_DpcDrainHere();    /* see apu_isr_on_holder */
         xbox_worker_stack_free(slot);
     }
     if (how == XBOX_IRQ_GATED)

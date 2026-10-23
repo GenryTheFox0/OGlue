@@ -155,13 +155,71 @@ void xbox_FramebufferWindowSetAA(uint32_t sy)
     s_fb_aa_sy = sy ? sy : 1;
 }
 
+/* GENRY 2026-10-22 (Шрам): GENRY_PACING=1 -- the rhythm of frames, once a
+ * second: the gaps between the title's flips, and between the frames the
+ * window actually puts on screen (new ones, repeats, ones it never showed).
+ * An FPS counter at 60 says nothing about a picture that arrives in bursts. */
+typedef struct {
+    const char *name;
+    LARGE_INTEGER last, t0;
+    unsigned n, fast, ok, slow, late;
+    double max_ms;
+} PaceStat;
+static volatile LONG s_present_seq;     /* frames published by the flip */
+static int pacing_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("GENRY_PACING") != NULL;
+    return on;
+}
+static double pace_ms(LARGE_INTEGER a, LARGE_INTEGER b)
+{
+    static LARGE_INTEGER f;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    return (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+}
+/* One event; prints and resets after a second. `extra` goes on the line. */
+static void pace_tick(PaceStat *p, const char *extra)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (p->last.QuadPart) {
+        double d = pace_ms(p->last, now);
+        p->n++;
+        if (d < 12.0) p->fast++;
+        else if (d < 22.0) p->ok++;
+        else if (d < 40.0) p->slow++;
+        else p->late++;
+        if (d > p->max_ms) p->max_ms = d;
+    } else {
+        p->t0 = now;
+    }
+    p->last = now;
+    if (pace_ms(p->t0, now) >= 1000.0) {
+        fprintf(stderr, "[PACE] %s %u: <12ms %u, 12-22 %u, 22-40 %u, >40 %u, max %.1f ms%s%c",
+                p->name, p->n, p->fast, p->ok, p->slow, p->late, p->max_ms, extra ? extra : "", 10);
+        p->n = p->fast = p->ok = p->slow = p->late = 0;
+        p->max_ms = 0;
+        p->t0 = now;
+    }
+}
+
+/* Flips so far, for a title's own diagnostics (the hitch catcher). */
+static volatile LONG s_flip_total;
+LONG xbox_FramebufferFlipTotal(void) { return s_flip_total; }
+
 /* Called by the pushbuffer executor when the title flips. */
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
+    InterlockedIncrement(&s_flip_total);
     const uint8_t *src;
     LONG next;
     uint32_t bpp, x, y;
 
+    if (pacing_on()) {
+        static PaceStat flip = { "flips" };
+        pace_tick(&flip, NULL);
+    }
     if (!s_fb_running || !fb_va || !pitch)
         return;
     if (getenv("RECOMP_FB_VA"))
@@ -205,6 +263,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
         genry_movie_overlay(s_present[next], s_fb_width, s_fb_height);
     }
     /* Published only once it is whole. */
+    InterlockedIncrement(&s_present_seq);
     InterlockedExchange(&s_present_idx, next);
     if (s_present_evt)
         SetEvent(s_present_evt);
@@ -642,12 +701,37 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
             LONG idx = s_present_idx;
+            LONG seq = s_present_seq;
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
             if (!fb_pinned)
                 fb_overlay();
             paced = fb_show(hwnd, hdc, &bi);
+            if (pacing_on()) {
+                /* a new frame on screen, a repeat of the last one, and how
+                 * many flips went by unseen in between */
+                static PaceStat shown = { "shown" };
+                static LONG last_seq;
+                static unsigned repeats, skipped;
+                char extra[64];
+                if (seq == last_seq) {
+                    repeats++;
+                } else {
+                    if (last_seq && seq - last_seq > 1)
+                        skipped += (unsigned)(seq - last_seq - 1);
+                    last_seq = seq;
+                    _snprintf(extra, sizeof extra, ", repeats %u, never shown %u", repeats, skipped);
+                    extra[sizeof extra - 1] = 0;
+                    if (shown.t0.QuadPart && shown.last.QuadPart) {
+                        LARGE_INTEGER now;
+                        QueryPerformanceCounter(&now);
+                        if (pace_ms(shown.t0, now) >= 1000.0)
+                            repeats = skipped = 0;
+                    }
+                    pace_tick(&shown, extra);
+                }
+            }
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */

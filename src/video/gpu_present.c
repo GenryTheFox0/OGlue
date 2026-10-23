@@ -52,8 +52,13 @@ int gpu_present_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
+        /* GENRY 2026-10-22 (Шрам): on unless RECOMP_D3D_PRESENT=0. GDI's
+         * HALFTONE stretch of a 640x480 frame to a 1080p screen took ~45 ms:
+         * Sonic Heroes flipped 60 frames a second and the window showed 24 of
+         * them (GENRY_PACING), "60 FPS that looks like 15". Through D3D11,
+         * 54-60 reach the screen. */
         const char *e = getenv("RECOMP_D3D_PRESENT");
-        on = e && *e && *e != '0';
+        on = !(e && *e == '0');
     }
     return on;
 }

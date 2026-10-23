@@ -133,12 +133,19 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
     bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+    /* GENRY 2026-10-22 (Шрам): read once. A getenv on every trapped access
+     * scanned the environment thousands of times a second inside
+     * DirectSound's lock, and Sonic Heroes' main thread, waiting for that
+     * lock, missed frames by 60-235 ms (GENRY_HITCH). */
+    static int trace = -1;
+    if (trace < 0)
+        trace = apu_env_on("RECOMP_APU_TRACE");
 
     /* What the title actually asks the APU for. The DSPs are stubbed here, so
      * a title that waits on one waits forever, and the only way to work out
      * what it is waiting for is to see the register traffic that precedes the
      * wait. */
-    if (apu_env_on("RECOMP_APU_TRACE")) {
+    if (trace) {
         static unsigned n;
         if (n++ < 400) {
             /* The value as well as the offset: finding which register carries
